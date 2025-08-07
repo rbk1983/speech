@@ -316,7 +316,7 @@ def main():
 
             # Notes (stored in session only)
             note_key = f"note_{i}"
-            cur_note = st.text_area("Private note (saved in this session only)", value=st.session_state.get(note_key,""))
+            cur_note = st.text_area("Private note (saved in this session only)", key=note_key, value=st.session_state.get(note_key, ""))
             st.session_state[note_key] = cur_note
 
             with st.expander("Full Transcript (cleaned)"):
