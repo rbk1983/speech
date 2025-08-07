@@ -1,4 +1,4 @@
 pandas
-beautifulsoup4
 streamlit
+altair
 scikit-learn
