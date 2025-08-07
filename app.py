@@ -216,6 +216,76 @@ def build_briefing_html(topic: str, df: pd.DataFrame, quotes: List[Tuple[str,str
 # App
 # -----------------------------
 
+
+def filter_df_by_query(df: pd.DataFrame, query: str) -> pd.DataFrame:
+    """Return only rows whose cleaned transcript contains at least one query term."""
+    if not query or not query.strip():
+        return df.copy()
+    q_terms = [w for w in re.split(r"\W+", query.lower()) if w]
+    if not q_terms:
+        return df.copy()
+    def has_term(txt: str) -> bool:
+        low = (txt or "").lower()
+        return any(t in low for t in q_terms)
+    return df[df["clean_transcript"].apply(has_term)].copy()
+
+def pick_sentences_for_terms(df: pd.DataFrame, terms: list[str], per_term: int = 1) -> dict[str, list[str]]:
+    """For each term, pick up to per_term strong sentences containing the term across the subset."""
+    out = {t: [] for t in terms}
+    if df.empty or not terms:
+        return out
+    for _, row in df.iterrows():
+        sents = sentence_split(row["clean_transcript"])
+        for t in terms:
+            if len(out[t]) >= per_term:
+                continue
+            cand = [s for s in sents if t.lower() in s.lower()]
+            if cand:
+                chosen = sorted(cand, key=lambda s: len(s), reverse=True)[0]
+                out[t].append(chosen[:220])
+    return out
+
+def narrative_compare(df: pd.DataFrame, year_a: int, year_b: int, query: str, top_n:int=5) -> dict:
+    """Produce narrative compare data structures for two years focusing on speeches that match the query."""
+    sub_a = filter_df_by_query(df[df['date'].dt.year == year_a], query)
+    sub_b = filter_df_by_query(df[df['date'].dt.year == year_b], query)
+
+    terms_a = [t for t,_ in top_terms(sub_a['clean_transcript'].tolist(), n=20)][:top_n]
+    terms_b = [t for t,_ in top_terms(sub_b['clean_transcript'].tolist(), n=20)][:top_n]
+
+    terms_a = terms_a or []
+    terms_b = terms_b or []
+
+    sent_map_a = pick_sentences_for_terms(sub_a, terms_a, per_term=1)
+    sent_map_b = pick_sentences_for_terms(sub_b, terms_b, per_term=1)
+
+    set_a, set_b = set(terms_a), set(terms_b)
+    gained = list(set_b - set_a)
+    lost = list(set_a - set_b)
+    common = list(set_a & set_b)
+
+    def term_freqs(df_sub, terms):
+        freqs = {t:0 for t in terms}
+        for _, r in df_sub.iterrows():
+            low = r['clean_transcript'].lower()
+            for t in terms:
+                freqs[t] += low.count(t.lower())
+        return freqs
+
+    freq_a = term_freqs(sub_a, common)
+    freq_b = term_freqs(sub_b, common)
+    up = [t for t in common if freq_b.get(t,0) > freq_a.get(t,0)]
+    down = [t for t in common if freq_b.get(t,0) < freq_a.get(t,0)]
+
+    return {
+        "sub_a": sub_a, "sub_b": sub_b,
+        "terms_a": terms_a, "terms_b": terms_b,
+        "sent_a": sent_map_a, "sent_b": sent_map_b,
+        "gained": gained, "lost": lost,
+        "up": up, "down": down,
+    }
+
+
 def main():
     st.set_page_config(page_title="Kristalina Speech Intelligence", layout="wide")
     st.title("Kristalina Georgieva — Speech Intelligence Platform")
@@ -336,36 +406,53 @@ def main():
             with st.expander("Full Transcript (cleaned)"):
                 st.write(row["clean_transcript"])
 
-    # --- Quick Compare ---
-    st.header("Quick Compare")
+
+    # --- Quick Compare (Narrative, query-focused) ---
+    st.header("Quick Compare (Narrative)")
     years_all = sorted(df['date'].dt.year.unique().tolist())
     colA, colB = st.columns(2)
     year_a = colA.selectbox("Year A", options=years_all, index=0 if years_all else None)
     year_b = colB.selectbox("Year B", options=years_all, index=min(1, len(years_all)-1) if len(years_all)>1 else 0)
-    cmp_theme = st.selectbox("Focus Theme (optional)", options=["(All)"] + all_themes, index=0)
 
-    def filter_year_theme(y):
-        sub = df[df['date'].dt.year == y]
-        if cmp_theme != "(All)":
-            sub = sub[sub['themes_u'].apply(lambda lst: cmp_theme in lst)]
-        return sub
+    if year_a == year_b:
+        st.info("Select two different years to compare.")
+    else:
+        info = narrative_compare(df, year_a, year_b, query.strip(), top_n=5)
+        sub_a, sub_b = info["sub_a"], info["sub_b"]
+        terms_a, terms_b = info["terms_a"], info["terms_b"]
+        sent_a, sent_b = info["sent_a"], info["sent_b"]
 
-    if years_all:
-        A = filter_year_theme(year_a)
-        B = filter_year_theme(year_b)
-        st.write(f"**{year_a}** speeches: {len(A)} | **{year_b}** speeches: {len(B)}")
-        # Term drift
-        sim = drift_score(A['clean_transcript'].tolist(), B['clean_transcript'].tolist())
-        st.write(f"**Message similarity (0–1):** {sim:.2f} (lower = more drift)")
-        # Top terms
-        col1, col2 = st.columns(2)
-        col1.write(f"**Top terms {year_a}**")
-        for t, _ in top_terms(A['clean_transcript'].tolist(), 12):
-            col1.write(f"- {t}")
-        col2.write(f"**Top terms {year_b}**")
-        for t, _ in top_terms(B['clean_transcript'].tolist(), 12):
-            col2.write(f"- {t}")
+        if sub_a.empty and sub_b.empty:
+            st.warning("No speeches found matching your query in either year.")
+        else:
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown(f"### {year_a}: Focus areas")
+                if terms_a:
+                    for t in terms_a:
+                        sent = sent_a.get(t, [''])[0] if sent_a.get(t) else ''
+                        st.markdown(f"- **{t}** — {sent}")
+                else:
+                    st.write("No clear focus terms found for this year (given the current query).")
+            with c2:
+                st.markdown(f"### {year_b}: Focus areas")
+                if terms_b:
+                    for t in terms_b:
+                        sent = sent_b.get(t, [''])[0] if sent_b.get(t) else ''
+                        st.markdown(f"- **{t}** — {sent}")
+                else:
+                    st.write("No clear focus terms found for this year (given the current query).")
 
+            gained = info["gained"]; lost = info["lost"]; up = info["up"]; down = info["down"]
+            st.markdown("### Messaging evolution")
+            parts = []
+            if gained: parts.append(f"**New emphasis in {year_b}:** " + ', '.join(sorted(gained)) + ".")
+            if lost: parts.append(f"**Less emphasis vs {year_a}:** " + ', '.join(sorted(lost)) + ".")
+            if up: parts.append(f"**Topics that gained share:** " + ', '.join(sorted(up)) + ".")
+            if down: parts.append(f"**Topics that declined:** " + ', '.join(sorted(down)) + ".")
+            if not parts:
+                parts.append("Overall emphasis appears stable between the two years for this query.")
+            st.markdown(" ".join(parts))
     # --- Briefing Pack ---
     st.header("Briefing Pack")
     brief_topic = st.text_input("Briefing Topic", value=query if query else "")
