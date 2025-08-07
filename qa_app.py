@@ -271,6 +271,8 @@ def main():
         if isinstance(date_range, tuple) and len(date_range) == 2:
             start_date, end_date = date_range
             results = results[(results['date'].dt.date >= start_date) & (results['date'].dt.date <= end_date)]
+        # Sort results by recency (most recent first) to prioritise the latest speeches
+        results = results.sort_values(by='date', ascending=False)
         # Show results count and export option
         st.write(f"Found **{len(results)}** speeches matching your query.")
         if not results.empty:
