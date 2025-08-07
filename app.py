@@ -151,6 +151,7 @@ def top_quotes(query: str, df: pd.DataFrame, k: int = 5) -> List[Tuple[str,str,s
     return out
 
 def top_terms(texts: List[str], n: int = 15) -> List[Tuple[str,float]]:
+    texts = [t for t in (texts or []) if isinstance(t, str) and t.strip()]
     if not texts:
         return []
     vec = TfidfVectorizer(stop_words="english", max_features=2000)
@@ -161,14 +162,27 @@ def top_terms(texts: List[str], n: int = 15) -> List[Tuple[str,float]]:
     return pairs
 
 def drift_score(texts_a: List[str], texts_b: List[str]) -> float:
-    # Cosine similarity between aggregated topic vectors; lower = more drift
-    if not texts_a or not texts_b:
+    # Robust cosine similarity between averaged TF-IDF vectors (lower = more drift)
+    try:
+        texts_a = [t for t in (texts_a or []) if isinstance(t, str) and t.strip()]
+        texts_b = [t for t in (texts_b or []) if isinstance(t, str) and t.strip()]
+        if not texts_a or not texts_b:
+            return 0.0
+        vec = TfidfVectorizer(stop_words="english", max_features=3000)
+        XA = vec.fit_transform(texts_a)
+        XB = vec.transform(texts_b)
+        if XA.shape[1] == 0 or XB.shape[1] == 0:
+            return 0.0
+        A = XA.mean(axis=0)
+        B = XB.mean(axis=0)
+        A_arr = A.A if hasattr(A, "A") else A
+        B_arr = B.A if hasattr(B, "A") else B
+        sim = cosine_similarity(A_arr, B_arr).ravel()[0]
+        if sim != sim:
+            return 0.0
+        return float(sim)
+    except Exception:
         return 0.0
-    vec = TfidfVectorizer(stop_words="english", max_features=3000)
-    A = vec.fit_transform(texts_a).mean(axis=0)
-    B = vec.transform(texts_b).mean(axis=0)
-    sim = cosine_similarity(A, B).ravel()[0]
-    return float(sim)
 
 def build_briefing_html(topic: str, df: pd.DataFrame, quotes: List[Tuple[str,str,str]]) -> str:
     html = io.StringIO()
