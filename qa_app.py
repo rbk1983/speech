@@ -37,9 +37,9 @@ def load_df() -> pd.DataFrame:
 
     # Unified theme column
     if "new_themes" in df.columns:
-        df["themes_u"] = df["new_themes"]
+        df["themes_u"] = df.get("new_themes")
     elif "themes" in df.columns:
-        df["themes_u"] = df["themes"]
+        df["themes_u"] = df["themes"].apply(lambda x: x if isinstance(x, list) else [])
     else:
         df["themes_u"] = [[] for _ in range(len(df))]
 
@@ -186,16 +186,14 @@ def main():
 
     # Apply query relevance scoring if a query is provided
     if query.strip():
-        q_vec = TfidfVectorizer(stop_words="english").fit(df["clean_transcript"]).transform([query])
-        # Use cosine similarity against full-text matrix
-        # (use same vocabulary by rebuilding vec to ensure compatibility)
-        vec_q = TfidfVectorizer(stop_words="english")
-        vec_q.fit(df["clean_transcript"])
-        X_q = vec_q.transform(df["clean_transcript"])
-        sims = cosine_similarity(q_vec, X_q).ravel()
-        results = results.assign(score=sims)
-        # Keep speeches with some relevance
-        results = results[results["score"] > 0]
+        # Compute similarities using the SAME vectorizer/corpus built on the full df
+        q_vec = vec.transform([query])
+        sims = cosine_similarity(q_vec, X).ravel()
+        # Align scores to the original df index, then join into the (possibly filtered) results
+        score_series = pd.Series(sims, index=df.index, name='score')
+        results = results.join(score_series, how='left')
+        # Keep speeches with some relevance (scores > 0)
+        results = results[results['score'].fillna(0) > 0]
 
     # Always show newest first
     results = results.sort_values(by="date", ascending=False)
