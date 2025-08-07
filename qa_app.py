@@ -154,17 +154,59 @@ def extract_keywords(text: str, n: int = 5) -> List[str]:
     return [w for w, _ in sorted_words[:n]]
 
 
+def bullet_summary(text: str, n: int = 3) -> List[str]:
+    """Create a simple bullet‑point summary of the given speech text.
+
+    The function splits the text into sentences and selects the first
+    ``n`` sentences that are reasonably short (<= 200 characters).  It
+    serves as a heuristic to extract the main introductory points of a
+    speech for quick reading.
+    """
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    bullets = []
+    for s in sentences:
+        s = s.strip()
+        if s:
+            bullets.append(s)
+            if len(bullets) >= n:
+                break
+    return bullets
+
+
+def top_quotes_across_results(query: str, transcripts: List[str], k: int = 3) -> List[str]:
+    """Return the top ``k`` sentences containing the query terms across multiple transcripts.
+
+    This function searches through all transcripts, extracts sentences
+    containing any of the query words, and sorts them by length (shorter
+    first) to provide concise quotes.  Duplicate sentences are
+    removed.  If fewer than ``k`` sentences are found, the remaining
+    slots are left empty.
+    """
+    words = [re.escape(w) for w in query.strip().split() if w]
+    pattern = re.compile(r'(' + '|'.join(words) + r')', re.IGNORECASE)
+    found = []
+    for text in transcripts:
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        for s in sentences:
+            if pattern.search(s):
+                quote = s.strip()
+                if quote not in found:
+                    found.append(quote)
+    # Sort by length for concise quotes
+    found = sorted(found, key=lambda s: len(s))
+    return found[:k]
+
+
 def main():
     st.set_page_config(page_title="IMF MD Speeches Explorer", layout="wide")
     st.title("Kristalina Georgieva Speeches (Aug 2022 – Aug 2025)")
     st.write(
         "Use this tool to explore the speeches delivered by IMF Managing Director "
         "Kristalina Georgieva between **August 7 2022** and **August 7 2025**. "
-        "Enter a topic or keyword to search across the speech transcripts. "
-        "Results are ordered by relevance and recency."
+        "You can search for topics within speech transcripts, filter by themes, location and date, "
+        "view trends over time, and export results."
     )
-    # Locate the pickle file.  Look in the current directory first, then
-    # fallback to /home/oai/share.
+    # Locate the pickle file.  Look in the current directory first, then fallback to /home/oai/share.
     pkl_candidates = [
         os.path.join(os.getcwd(), 'speeches_data.pkl'),
         os.path.join('/home/oai/share', 'speeches_data.pkl'),
@@ -178,74 +220,89 @@ def main():
         st.error("Could not find speeches_data.pkl. Please run the extraction script first.")
         return
     df = load_data(pkl_path)
-    # Build TF‑IDF matrix
+    # Build TF‑IDF matrix for searching
     vectoriser, matrix = build_tfidf_matrix(df['transcript'].tolist())
+    # Sidebar filters
+    st.sidebar.header("Filters")
     # Theme filter sidebar
     all_themes = sorted({theme for sublist in df['themes'] for theme in sublist})
     selected_themes = st.sidebar.multiselect(
-        'Filter by Theme (optional)', options=all_themes, default=[]
+        'By Theme', options=all_themes, default=[]
+    )
+    # Location filter sidebar
+    unique_locations = sorted({loc for loc in df['location'] if loc})
+    selected_locations = st.sidebar.multiselect(
+        'By Location', options=unique_locations, default=[]
     )
     # Date range filter sidebar
     min_date, max_date = df['date'].min().date(), df['date'].max().date()
     date_range = st.sidebar.date_input(
-        'Filter by Date Range', value=(min_date, max_date), min_value=min_date, max_value=max_date
+        'By Date Range', value=(min_date, max_date), min_value=min_date, max_value=max_date
     )
-    query = st.text_input('Enter a topic or keyword')
+    # Display dataset overview charts
+    st.subheader("Dataset Overview")
+    col1, col2 = st.columns(2)
+    with col1:
+        # Theme distribution bar chart
+        theme_counts = pd.Series([t for sub in df['themes'] for t in sub]).value_counts().reset_index()
+        theme_counts.columns = ['Theme', 'Count']
+        st.markdown("**Speeches per Theme**")
+        st.bar_chart(theme_counts.set_index('Theme'))
+    with col2:
+        # Timeline of number of speeches per year
+        df['year'] = df['date'].dt.year
+        year_counts = df.groupby('year').size().reset_index(name='Count')
+        st.markdown("**Speeches per Year**")
+        st.line_chart(year_counts.set_index('year'))
+    # Keyword overview across all speeches
+    overall_keywords = extract_keywords(' '.join(df['transcript'].tolist()), n=10)
+    st.markdown("**Top Keywords Across All Speeches:** " + ', '.join(overall_keywords))
+    # Search box
+    query = st.text_input('Enter a topic or keyword to search the speeches')
     if query:
         results = search_speeches(query, df, vectoriser, matrix)
         # Apply theme filter
         if selected_themes:
-            mask = results['themes'].apply(lambda lst: any(t in selected_themes for t in lst))
-            results = results[mask]
+            results = results[results['themes'].apply(lambda lst: any(t in selected_themes for t in lst))]
+        # Apply location filter
+        if selected_locations:
+            results = results[results['location'].isin(selected_locations)]
         # Apply date range filter
         if isinstance(date_range, tuple) and len(date_range) == 2:
             start_date, end_date = date_range
             results = results[(results['date'].dt.date >= start_date) & (results['date'].dt.date <= end_date)]
-        # Sorting option
-        sort_option = st.sidebar.selectbox(
-            'Sort results by', options=['Relevance', 'Recency'], index=0
-        )
-        if sort_option == 'Recency':
-            results = results.sort_values(by='date', ascending=False)
+        # Show results count and export option
         st.write(f"Found **{len(results)}** speeches matching your query.")
         if not results.empty:
-            # High level summary across all results
-            with st.expander('Summary across all matching speeches'):
-                all_text = ' '.join(results['transcript'].tolist())
-                summary = summarise_text(all_text, query, max_sentences=5)
-                st.markdown(summary)
-                # Keyword extraction and year breakdown
-                st.subheader('Key statistics by year')
-                year_info = []
-                for year, group in results.groupby(results['date'].dt.year):
-                    year_text = ' '.join(group['transcript'].tolist())
-                    year_summary = summarise_text(year_text, query, max_sentences=3)
-                    keywords = extract_keywords(year_text, n=5)
-                    year_info.append(
-                        {
-                            'Year': year,
-                            'Speeches': len(group),
-                            'Top words': ', '.join(keywords),
-                            'Summary': year_summary,
-                        }
-                    )
-                # Display year breakdown
-                for info in sorted(year_info, key=lambda x: x['Year'], reverse=True):
-                    st.markdown(f"**{info['Year']}** – {info['Speeches']} speeches. Top words: {info['Top words']}")
-                    st.markdown(info['Summary'])
-                    st.markdown('')
-        # Display individual results as an expandable list
+            # Export results to CSV button
+            csv = results[['title', 'date', 'link', 'location', 'themes']].to_csv(index=False)
+            st.download_button(
+                label="Download results as CSV", data=csv, file_name="search_results.csv", mime="text/csv"
+            )
+            # Top quotes across results
+            quotes = top_quotes_across_results(query, results['transcript'].tolist(), k=3)
+            if quotes:
+                st.markdown("**Top Quotes Containing Your Keyword:**")
+                for i, q in enumerate(quotes, 1):
+                    st.markdown(f"- {q}")
+        # Display individual results
         for _, row in results.iterrows():
             with st.expander(f"{row['date'].strftime('%Y-%m-%d')} – {row['title']}"):
                 st.markdown(f"**Location:** {row['location'] or 'N/A'}  ")
                 st.markdown(f"**Themes:** {', '.join(row['themes']) if row['themes'] else 'N/A'}  ")
                 st.markdown(f"**Link:** [View Speech]({row['link']})  ")
+                # Bullet summary
+                bullets = bullet_summary(row['transcript'], n=3)
+                st.markdown("**Key Points:**")
+                for b in bullets:
+                    st.markdown(f"- {b}")
+                # Show snippet around query
                 snippet = highlight_matches(row['transcript'], query)
+                st.markdown("**Snippet:**")
                 st.markdown(snippet)
-                # Provide a brief summary for each speech
-                st.markdown('**Summary:**')
-                speech_summary = summarise_text(row['transcript'], query, max_sentences=5)
-                st.markdown(speech_summary)
+                # Optionally show full transcript
+                if st.checkbox(f"Show full transcript of '{row['title']}'", key=row['link']):
+                    st.text(row['transcript'])
     else:
         st.write("Enter a keyword above to start searching.")
 
