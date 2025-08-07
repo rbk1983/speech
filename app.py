@@ -347,36 +347,102 @@ def extract_focus_issues_for_query(df_sub: pd.DataFrame, query: str, top_n: int 
     # Nice formatting
     issues = [iss.capitalize() for iss in issues]
     return issues, reps
+
+def _co_terms_for_issue(sentences: list[str], issue: str, top_k: int = 6) -> list[str]:
+    """Return top co-occurring terms (1-2 grams) that appear with the issue across given sentences."""
+    if not sentences:
+        return []
+    # Build tf-idf over sentences after removing the issue words
+    issue_tokens = set(re.split(r"\W+", issue.lower()))
+    def strip_issue(s: str) -> str:
+        toks = [w for w in re.split(r"\W+", s.lower()) if w and w not in issue_tokens]
+        return " ".join(toks)
+    cleaned = [strip_issue(s) for s in sentences if s.strip()]
+    if not any(cleaned):
+        return []
+    vec = TfidfVectorizer(stop_words="english", ngram_range=(1,2), max_features=2000)
+    X = vec.fit_transform(cleaned)
+    terms = vec.get_feature_names_out()
+    scores = X.sum(axis=0).A1
+    pairs = sorted(zip(terms, scores), key=lambda x: x[1], reverse=True)
+    # filter generic
+    stop_extra = set(["countries","country","global","world","growth","economic","economy","financial","policy","policies","support","better","including","across","around","among","international","national","public","private","sector","people","today","conference","remarks","need","needs","important","work","future","help"])
+    kept = []
+    for t, _ in pairs:
+        if any(ch.isdigit() for ch in t): 
+            continue
+        if t in stop_extra: 
+            continue
+        kept.append(t)
+        if len(kept) >= top_k:
+            break
+    return kept
+
+def summarize_issue(df_sub: pd.DataFrame, issue: str, max_len: int = 220) -> str:
+    """Create a brief narrative (not a quote) describing how the issue is discussed in the subset."""
+    if df_sub.empty:
+        return "No material for this issue in the selected year."
+    # Collect sentences that mention the issue
+    sents = []
+    for _, r in df_sub.iterrows():
+        for s in sentence_split(r["clean_transcript"]):
+            if issue.lower() in s.lower():
+                sents.append(s)
+    if not sents:
+        return "Mentioned tangentially without sustained discussion."
+    # Extract co-terms and craft narrative
+    coterms = _co_terms_for_issue(sents, issue, top_k=6)
+    # Simple heuristic narrative
+    lead = f"Discussed in connection with {', '.join(coterms[:3])}" if coterms else "Discussed in several contexts"
+    add = ""
+    if len(coterms) > 3:
+        add = f"; also touching on {', '.join(coterms[3:5])}"
+    count = len(sents)
+    phr = "speeches" if count > 1 else "speech"
+    narrative = f"{lead}{add}. Referenced across {count} {phr}, with emphasis on policy implications and implementation needs."
+    # Trim
+    narrative = (narrative[:max_len] + "…") if len(narrative) > max_len else narrative
+    return narrative
+
 def narrative_compare(df: pd.DataFrame, year_a: int, year_b: int, query: str, top_n:int=5) -> dict:
     sub_a = filter_df_by_query(df[df['date'].dt.year == year_a], query)
     sub_b = filter_df_by_query(df[df['date'].dt.year == year_b], query)
 
-    issues_a, reps_a = extract_focus_issues_for_query(sub_a, query, top_n=top_n)
-    issues_b, reps_b = extract_focus_issues_for_query(sub_b, query, top_n=top_n)
+    issues_a, _ = extract_focus_issues_for_query(sub_a, query, top_n=top_n)
+    issues_b, _ = extract_focus_issues_for_query(sub_b, query, top_n=top_n)
 
-    set_a, set_b = set([i.lower() for i in issues_a]), set([i.lower() for i in issues_b])
+    # Build per-issue narratives (not quotes)
+    narr_a = {iss: summarize_issue(sub_a, iss) for iss in issues_a}
+    narr_b = {iss: summarize_issue(sub_b, iss) for iss in issues_b}
+
+    set_a = set([i.lower() for i in issues_a])
+    set_b = set([i.lower() for i in issues_b])
     gained = sorted(list(set_b - set_a))
-    lost = sorted(list(set_a - set_b))
+    lost   = sorted(list(set_a - set_b))
     common = sorted(list(set_a & set_b))
 
-    # frequencies for common issues to infer up/down
+    # Compute emphasis change on common issues via crude frequency deltas
     def freq(df_sub, term):
         total = 0
         for _, r in df_sub.iterrows():
             total += r['clean_transcript'].lower().count(term.lower())
         return total
 
-    up, down = [], []
+    emphasis = []
     for t in common:
         fa = freq(sub_a, t); fb = freq(sub_b, t)
-        if fb > fa: up.append(t)
-        elif fa > fb: down.append(t)
+        if fb > fa: 
+            emphasis.append((t, "more emphasis in Year B"))
+        elif fa > fb:
+            emphasis.append((t, "less emphasis in Year B"))
+        else:
+            emphasis.append((t, "similar emphasis"))
 
     return {
         "sub_a": sub_a, "sub_b": sub_b,
         "issues_a": issues_a, "issues_b": issues_b,
-        "reps_a": reps_a, "reps_b": reps_b,
-        "gained": gained, "lost": lost, "up": up, "down": down
+        "narr_a": narr_a, "narr_b": narr_b,
+        "gained": gained, "lost": lost, "emphasis": emphasis
     }
 
 
@@ -514,7 +580,7 @@ def main():
         info = narrative_compare(df, year_a, year_b, query.strip(), top_n=5)
         sub_a, sub_b = info["sub_a"], info["sub_b"]
         issues_a, issues_b = info["issues_a"], info["issues_b"]
-        reps_a, reps_b = info["reps_a"], info["reps_b"]
+        narr_a, narr_b = info["narr_a"], info["narr_b"]
 
         if sub_a.empty and sub_b.empty:
             st.warning("No speeches found matching your query in either year.")
@@ -537,16 +603,23 @@ def main():
                 else:
                     st.write("No clear focus issues found for this year (given the current query).")
 
-            gained = info["gained"]; lost = info["lost"]; up = info["up"]; down = info["down"]
-            st.markdown("### Messaging evolution")
-            parts = []
-            if gained: parts.append(f"**New emphasis in {year_b}:** " + ', '.join(sorted(gained)) + ".")
-            if lost: parts.append(f"**Less emphasis vs {year_a}:** " + ', '.join(sorted(lost)) + ".")
-            if up: parts.append(f"**Topics that gained share:** " + ', '.join(sorted(up)) + ".")
-            if down: parts.append(f"**Topics that declined:** " + ', '.join(sorted(down)) + ".")
-            if not parts:
-                parts.append("Overall emphasis appears stable between the two years for this query.")
-            st.markdown(" ".join(parts))
+            st.markdown("### Messaging evolution (issue-focused)")
+            gained = info["gained"]; lost = info["lost"]; emphasis = info["emphasis"]
+            narrative = []
+            if gained:
+                narrative.append("**New issues in Year B:** " + ", ".join(gained) + ".")
+            if lost:
+                narrative.append("**Issues deemphasized vs Year A:** " + ", ".join(lost) + ".")
+            if emphasis:
+                ups = [t for t, msg in emphasis if "more emphasis" in msg]
+                downs = [t for t, msg in emphasis if "less emphasis" in msg]
+                if ups:
+                    narrative.append("**Greater emphasis in Year B on:** " + ", ".join(sorted(ups)) + ".")
+                if downs:
+                    narrative.append("**Reduced emphasis in Year B on:** " + ", ".join(sorted(downs)) + ".")
+            if not narrative:
+                narrative.append("Overall emphasis appears stable between the two years for this query.")
+            st.markdown(" ".join(narrative))
     # --- Briefing Pack ---
     st.header("Briefing Pack")
     brief_topic = st.text_input("Briefing Topic", value=query if query else "")
