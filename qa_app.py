@@ -97,6 +97,63 @@ def highlight_matches(text: str, query: str, max_sentences: int = 3) -> str:
         return snippet[:250] + ('…' if len(snippet) > 250 else '')
 
 
+def summarise_text(text: str, query: str, max_sentences: int = 5) -> str:
+    """Generate a simple summary of ``text`` focused on ``query`` terms.
+
+    The function extracts sentences containing any of the query words and
+    returns up to ``max_sentences`` of them joined together.  If no
+    sentences match, it returns the first 500 characters of the text.
+
+    This heuristic summariser provides a lightweight alternative to
+    advanced NLP summarisation libraries, which may not be available in
+    all environments.
+    """
+    words = [re.escape(w) for w in query.strip().split() if w]
+    if not words:
+        return text[:500] + ('…' if len(text) > 500 else '')
+    pattern = re.compile(r'(' + '|'.join(words) + r')', re.IGNORECASE)
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    matched = []
+    for s in sentences:
+        if pattern.search(s):
+            matched.append(s.strip())
+            if len(matched) >= max_sentences:
+                break
+    if matched:
+        return ' '.join(matched)
+    else:
+        return text[:500] + ('…' if len(text) > 500 else '')
+
+
+def extract_keywords(text: str, n: int = 5) -> List[str]:
+    """Extract the top ``n`` keywords from ``text`` based on term frequency.
+
+    This utility tokenises the text, filters out common stop words and
+    non‑alphabetic tokens, and returns the most frequent words.  It
+    serves as a simple proxy for identifying the main topics discussed
+    within a body of text.
+    """
+    # Minimal stop words list.  For a more comprehensive list consider
+    # importing from nltk or another library.
+    stop_words = set(
+        [
+            'the', 'and', 'to', 'of', 'a', 'in', 'for', 'that', 'on',
+            'is', 'with', 'as', 'are', 'be', 'this', 'by', 'an', 'it',
+            'or', 'from', 'at', 'our', 'we', 'will', 'has', 'have',
+            'not', 'new', 'more', 'can'
+        ]
+    )
+    words = re.findall(r'\b[a-zA-Z]{3,}\b', text.lower())
+    freq = {}
+    for w in words:
+        if w in stop_words:
+            continue
+        freq[w] = freq.get(w, 0) + 1
+    # Sort by frequency descending
+    sorted_words = sorted(freq.items(), key=lambda x: x[1], reverse=True)
+    return [w for w, _ in sorted_words[:n]]
+
+
 def main():
     st.set_page_config(page_title="IMF MD Speeches Explorer", layout="wide")
     st.title("Kristalina Georgieva Speeches (Aug 2022 – Aug 2025)")
@@ -144,8 +201,40 @@ def main():
         if isinstance(date_range, tuple) and len(date_range) == 2:
             start_date, end_date = date_range
             results = results[(results['date'].dt.date >= start_date) & (results['date'].dt.date <= end_date)]
+        # Sorting option
+        sort_option = st.sidebar.selectbox(
+            'Sort results by', options=['Relevance', 'Recency'], index=0
+        )
+        if sort_option == 'Recency':
+            results = results.sort_values(by='date', ascending=False)
         st.write(f"Found **{len(results)}** speeches matching your query.")
-        # Display results as an expandable list
+        if not results.empty:
+            # High level summary across all results
+            with st.expander('Summary across all matching speeches'):
+                all_text = ' '.join(results['transcript'].tolist())
+                summary = summarise_text(all_text, query, max_sentences=5)
+                st.markdown(summary)
+                # Keyword extraction and year breakdown
+                st.subheader('Key statistics by year')
+                year_info = []
+                for year, group in results.groupby(results['date'].dt.year):
+                    year_text = ' '.join(group['transcript'].tolist())
+                    year_summary = summarise_text(year_text, query, max_sentences=3)
+                    keywords = extract_keywords(year_text, n=5)
+                    year_info.append(
+                        {
+                            'Year': year,
+                            'Speeches': len(group),
+                            'Top words': ', '.join(keywords),
+                            'Summary': year_summary,
+                        }
+                    )
+                # Display year breakdown
+                for info in sorted(year_info, key=lambda x: x['Year'], reverse=True):
+                    st.markdown(f"**{info['Year']}** – {info['Speeches']} speeches. Top words: {info['Top words']}")
+                    st.markdown(info['Summary'])
+                    st.markdown('')
+        # Display individual results as an expandable list
         for _, row in results.iterrows():
             with st.expander(f"{row['date'].strftime('%Y-%m-%d')} – {row['title']}"):
                 st.markdown(f"**Location:** {row['location'] or 'N/A'}  ")
@@ -153,6 +242,10 @@ def main():
                 st.markdown(f"**Link:** [View Speech]({row['link']})  ")
                 snippet = highlight_matches(row['transcript'], query)
                 st.markdown(snippet)
+                # Provide a brief summary for each speech
+                st.markdown('**Summary:**')
+                speech_summary = summarise_text(row['transcript'], query, max_sentences=5)
+                st.markdown(speech_summary)
     else:
         st.write("Enter a keyword above to start searching.")
 
