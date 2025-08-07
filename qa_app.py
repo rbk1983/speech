@@ -206,8 +206,10 @@ def main():
         "You can search for topics within speech transcripts, filter by themes, location and date, "
         "view trends over time, and export results."
     )
-    # Locate the pickle file.  Look in the current directory first, then fallback to /home/oai/share.
+    # Locate the pickle file.  Prefer the reclassified dataset if available.  Look in the current directory first, then fallback to /home/oai/share.
     pkl_candidates = [
+        os.path.join(os.getcwd(), 'speeches_data_reclassified.pkl'),
+        os.path.join('/home/oai/share', 'speeches_data_reclassified.pkl'),
         os.path.join(os.getcwd(), 'speeches_data.pkl'),
         os.path.join('/home/oai/share', 'speeches_data.pkl'),
     ]
@@ -224,8 +226,9 @@ def main():
     vectoriser, matrix = build_tfidf_matrix(df['transcript'].tolist())
     # Sidebar filters
     st.sidebar.header("Filters")
-    # Theme filter sidebar
-    all_themes = sorted({theme for sublist in df['themes'] for theme in sublist})
+    # Theme filter sidebar (use new_themes if present)
+    theme_field = 'new_themes' if 'new_themes' in df.columns else 'themes'
+    all_themes = sorted({theme for sublist in df[theme_field] for theme in sublist})
     selected_themes = st.sidebar.multiselect(
         'By Theme', options=all_themes, default=[]
     )
@@ -234,6 +237,14 @@ def main():
     selected_locations = st.sidebar.multiselect(
         'By Location', options=unique_locations, default=[]
     )
+    # Geography (regional) filter based on detected geo tags if available
+    if 'geo_tags' in df.columns:
+        all_regions = sorted({tag for sublist in df['geo_tags'] for tag in sublist})
+        selected_regions = st.sidebar.multiselect(
+            'By Region (geo tag)', options=all_regions, default=[]
+        )
+    else:
+        selected_regions = []
     # Date range filter sidebar
     min_date, max_date = df['date'].min().date(), df['date'].max().date()
     date_range = st.sidebar.date_input(
@@ -244,7 +255,7 @@ def main():
     col1, col2 = st.columns(2)
     with col1:
         # Theme distribution bar chart
-        theme_counts = pd.Series([t for sub in df['themes'] for t in sub]).value_counts().reset_index()
+        theme_counts = pd.Series([t for sub in df[theme_field] for t in sub]).value_counts().reset_index()
         theme_counts.columns = ['Theme', 'Count']
         st.markdown("**Speeches per Theme**")
         st.bar_chart(theme_counts.set_index('Theme'))
@@ -263,10 +274,13 @@ def main():
         results = search_speeches(query, df, vectoriser, matrix)
         # Apply theme filter
         if selected_themes:
-            results = results[results['themes'].apply(lambda lst: any(t in selected_themes for t in lst))]
+            results = results[results[theme_field].apply(lambda lst: any(t in selected_themes for t in lst))]
         # Apply location filter
         if selected_locations:
             results = results[results['location'].isin(selected_locations)]
+        # Apply region filter if available
+        if selected_regions:
+            results = results[results.get('geo_tags', []).apply(lambda lst: any(tag in selected_regions for tag in lst))]
         # Apply date range filter
         if isinstance(date_range, tuple) and len(date_range) == 2:
             start_date, end_date = date_range
@@ -277,7 +291,15 @@ def main():
         st.write(f"Found **{len(results)}** speeches matching your query.")
         if not results.empty:
             # Export results to CSV button
-            csv = results[['title', 'date', 'link', 'location', 'themes']].to_csv(index=False)
+            # Determine which theme column to include in export
+            export_cols = ['title', 'date', 'link', 'location']
+            if theme_field in results.columns:
+                export_cols.append(theme_field)
+            elif 'themes' in results.columns:
+                export_cols.append('themes')
+            if 'geo_tags' in results.columns:
+                export_cols.append('geo_tags')
+            csv = results[export_cols].to_csv(index=False)
             st.download_button(
                 label="Download results as CSV", data=csv, file_name="search_results.csv", mime="text/csv"
             )
