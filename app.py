@@ -245,44 +245,138 @@ def pick_sentences_for_terms(df: pd.DataFrame, terms: list[str], per_term: int =
                 out[t].append(chosen[:220])
     return out
 
+
+CUSTOM_STOP = {
+    "countries","country","global","world","growth","economic","economy","financial","policy","policies",
+    "better","support","ensure","including","across","around","among","international","national","public",
+    "private","sector","sectors","people","many","much","year","years","today","conference","remarks",
+    "need","needs","important","make","made","making","work","working","future","forward","help","focus",
+    "focuses","focused","level","levels","part","parts","time","times","new","news","press","meeting",
+    "roundtable","framework","issue","issues","program","programs","programme","programmes"
+}
+
+AI_SYNONYMS = {
+    "artificial intelligence","ai","machine learning","ml","automation","algorithms","foundation models",
+    "large language models","llms","data governance","digital infrastructure","digital public infrastructure",
+    "dpi","compute","semiconductors","chips","chip supply","safety","guardrails","regulation","regulatory",
+    "ethics","bias","skills","reskilling","productivity","competitiveness","innovation","startup","startups"
+}
+
+def extract_focus_issues_for_query(df_sub: pd.DataFrame, query: str, top_n: int = 5):
+    """Extract top n 'issues' (1-3 gram phrases) from sentences that include the query (or synonyms)."""
+    if df_sub.empty:
+        return [], {}
+    q_terms = [w for w in re.split(r"\W+", (query or "").lower()) if w]
+    # Expand with synonyms if query looks like AI
+    if any(t in ("ai","artificial","intelligence","ml","machine","learning","automation","algorithm","algorithms") for t in q_terms):
+        q_syn = set()
+        for s in AI_SYNONYMS:
+            q_syn.update(re.split(r"\W+", s))
+        q_terms = list(set(q_terms) | q_syn)
+
+    # Collect sentences containing any query term
+    sent_pool = []
+    row_map = []  # keep index to map back for representative sentences
+    for idx, row in df_sub.iterrows():
+        sents = sentence_split(row["clean_transcript"])
+        for s in sents:
+            low = s.lower()
+            if any(t and t in low for t in q_terms):
+                sent_pool.append(s)
+                row_map.append((idx, s))
+
+    if not sent_pool:
+        return [], {}
+
+    # Vectorize with 1-3 grams and build tf-idf
+    vec = TfidfVectorizer(stop_words="english", ngram_range=(1,3), max_features=4000, min_df=1)
+    X = vec.fit_transform(sent_pool)
+    terms = vec.get_feature_names_out()
+    scores = X.sum(axis=0).A1
+    pairs = list(zip(terms, scores))
+    # Filter out junk/generic
+    def ok(term: str) -> bool:
+        t = term.lower().strip()
+        if len(t) < 3: return False
+        if any(x.isdigit() for x in t): return False
+        if t in CUSTOM_STOP: return False
+        if t in {"imf","georgieva","kristalina","press","center"}: return False
+        # prefer ngrams that are words not single generic terms
+        return True
+
+    # Prefer phrases that contain AI synonyms if the query is AI related
+    ai_query = any(w in {"ai","artificial","intelligence","machine","learning","automation","algorithm","algorithms"} for w in q_terms)
+    def rank_key(item):
+        t, sc = item
+        bonus = 1.0
+        if ai_query and any(k in t for k in ["ai","artificial intelligence","machine learning","llm","model","compute","semiconductor","chips","data","governance","productivity","skills","guardrails","regulation","innovation"]):
+            bonus = 1.5
+        # longer ngrams get slight boost
+        return sc * bonus * (1.0 + 0.1*min(2, t.count(" ")))
+
+    filtered = [p for p in pairs if ok(p[0])]
+    top = sorted(filtered, key=rank_key, reverse=True)[:max(5, top_n*2)]
+    # de-duplicate by stem-ish
+    issues = []
+    seen = set()
+    for t, _ in top:
+        sig = re.sub(r"[^a-z]", "", t.lower())
+        if sig in seen: 
+            continue
+        seen.add(sig)
+        issues.append(t)
+        if len(issues) >= top_n:
+            break
+
+    # Pick representative sentence for each issue
+    reps = {iss: "" for iss in issues}
+    for iss in issues:
+        best = ""
+        for (idx, s) in row_map:
+            if iss in s.lower():
+                if len(s) > len(best) and len(s) <= 240:
+                    best = s
+        if not best:
+            # fallback: longest sentence containing any token from issue
+            toks = [w for w in iss.split() if len(w) > 2]
+            for (idx, s) in row_map:
+                if any(w in s.lower() for w in toks):
+                    if len(s) > len(best) and len(s) <= 240:
+                        best = s
+        reps[iss] = best
+    # Nice formatting
+    issues = [iss.capitalize() for iss in issues]
+    return issues, reps
 def narrative_compare(df: pd.DataFrame, year_a: int, year_b: int, query: str, top_n:int=5) -> dict:
-    """Produce narrative compare data structures for two years focusing on speeches that match the query."""
     sub_a = filter_df_by_query(df[df['date'].dt.year == year_a], query)
     sub_b = filter_df_by_query(df[df['date'].dt.year == year_b], query)
 
-    terms_a = [t for t,_ in top_terms(sub_a['clean_transcript'].tolist(), n=20)][:top_n]
-    terms_b = [t for t,_ in top_terms(sub_b['clean_transcript'].tolist(), n=20)][:top_n]
+    issues_a, reps_a = extract_focus_issues_for_query(sub_a, query, top_n=top_n)
+    issues_b, reps_b = extract_focus_issues_for_query(sub_b, query, top_n=top_n)
 
-    terms_a = terms_a or []
-    terms_b = terms_b or []
+    set_a, set_b = set([i.lower() for i in issues_a]), set([i.lower() for i in issues_b])
+    gained = sorted(list(set_b - set_a))
+    lost = sorted(list(set_a - set_b))
+    common = sorted(list(set_a & set_b))
 
-    sent_map_a = pick_sentences_for_terms(sub_a, terms_a, per_term=1)
-    sent_map_b = pick_sentences_for_terms(sub_b, terms_b, per_term=1)
-
-    set_a, set_b = set(terms_a), set(terms_b)
-    gained = list(set_b - set_a)
-    lost = list(set_a - set_b)
-    common = list(set_a & set_b)
-
-    def term_freqs(df_sub, terms):
-        freqs = {t:0 for t in terms}
+    # frequencies for common issues to infer up/down
+    def freq(df_sub, term):
+        total = 0
         for _, r in df_sub.iterrows():
-            low = r['clean_transcript'].lower()
-            for t in terms:
-                freqs[t] += low.count(t.lower())
-        return freqs
+            total += r['clean_transcript'].lower().count(term.lower())
+        return total
 
-    freq_a = term_freqs(sub_a, common)
-    freq_b = term_freqs(sub_b, common)
-    up = [t for t in common if freq_b.get(t,0) > freq_a.get(t,0)]
-    down = [t for t in common if freq_b.get(t,0) < freq_a.get(t,0)]
+    up, down = [], []
+    for t in common:
+        fa = freq(sub_a, t); fb = freq(sub_b, t)
+        if fb > fa: up.append(t)
+        elif fa > fb: down.append(t)
 
     return {
         "sub_a": sub_a, "sub_b": sub_b,
-        "terms_a": terms_a, "terms_b": terms_b,
-        "sent_a": sent_map_a, "sent_b": sent_map_b,
-        "gained": gained, "lost": lost,
-        "up": up, "down": down,
+        "issues_a": issues_a, "issues_b": issues_b,
+        "reps_a": reps_a, "reps_b": reps_b,
+        "gained": gained, "lost": lost, "up": up, "down": down
     }
 
 
@@ -419,8 +513,8 @@ def main():
     else:
         info = narrative_compare(df, year_a, year_b, query.strip(), top_n=5)
         sub_a, sub_b = info["sub_a"], info["sub_b"]
-        terms_a, terms_b = info["terms_a"], info["terms_b"]
-        sent_a, sent_b = info["sent_a"], info["sent_b"]
+        issues_a, issues_b = info["issues_a"], info["issues_b"]
+        reps_a, reps_b = info["reps_a"], info["reps_b"]
 
         if sub_a.empty and sub_b.empty:
             st.warning("No speeches found matching your query in either year.")
@@ -428,20 +522,20 @@ def main():
             c1, c2 = st.columns(2)
             with c1:
                 st.markdown(f"### {year_a}: Focus areas")
-                if terms_a:
-                    for t in terms_a:
-                        sent = sent_a.get(t, [''])[0] if sent_a.get(t) else ''
+                if issues_a:
+                    for t in issues_a:
+                        sent = reps_a.get(t.lower(), reps_a.get(t, "")) or ""
                         st.markdown(f"- **{t}** — {sent}")
                 else:
-                    st.write("No clear focus terms found for this year (given the current query).")
+                    st.write("No clear focus issues found for this year (given the current query).")
             with c2:
                 st.markdown(f"### {year_b}: Focus areas")
-                if terms_b:
-                    for t in terms_b:
-                        sent = sent_b.get(t, [''])[0] if sent_b.get(t) else ''
+                if issues_b:
+                    for t in issues_b:
+                        sent = reps_b.get(t.lower(), reps_b.get(t, "")) or ""
                         st.markdown(f"- **{t}** — {sent}")
                 else:
-                    st.write("No clear focus terms found for this year (given the current query).")
+                    st.write("No clear focus issues found for this year (given the current query).")
 
             gained = info["gained"]; lost = info["lost"]; up = info["up"]; down = info["down"]
             st.markdown("### Messaging evolution")
