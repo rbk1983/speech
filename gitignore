@@ -1,0 +1,6 @@
+__pycache__/
+.venv/
+index.faiss
+meta.json
+chunks.json
+OPENAI_API_KEY
