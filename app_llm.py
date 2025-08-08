@@ -1,37 +1,37 @@
-# app_llm.py — LLM app with thematic Quick Compare (issues + evolution)
-import os, textwrap, datetime as _dt
+# app_llm.py — Phase 1: polished UX, controls, visuals, LLM narratives
+import os, datetime as _dt
 import streamlit as st
-from rag_utils import load_df, load_index, retrieve, llm
+import plotly.express as px
+from rag_utils import load_df, load_index, retrieve, sources_from_hits, format_hits_for_context, llm
 
 st.set_page_config(page_title="Kristalina Speech Intelligence (LLM)", layout="wide")
-st.title("Kristalina Georgieva — LLM Speech Intelligence")
+st.title("Kristalina Georgieva — Speech Intelligence")
 
-# --------- Ensure index exists (build-in-app if missing) ----------
+# ---------- Ensure index exists ----------
 def _index_files_present():
     return all(os.path.exists(p) for p in ["index.faiss", "meta.json", "chunks.json"])
 
 def _ensure_index():
     if _index_files_present():
         return True
-    st.warning("Search index not found in this app instance. Click below to build it here (one-time).")
+    st.warning("Search index not found here. Build it once in this app.")
     if not os.getenv("OPENAI_API_KEY"):
-        st.error("OPENAI_API_KEY is not set. In Streamlit Cloud, go to Settings → Secrets and add it, then redeploy.")
+        st.error("Set OPENAI_API_KEY in Streamlit Secrets and redeploy.")
         st.stop()
     if st.button("Build index now"):
-        with st.spinner("Building index… this can take a few minutes on first run. Keep this page open."):
+        with st.spinner("Building index…"):
             try:
                 from build_index import main as build_index_main
                 build_index_main()
-                st.success("Index built successfully. Click **Rerun** (top-right) or refresh the page.")
+                st.success("Index built. Click **Rerun** or refresh.")
                 st.stop()
             except Exception as e:
-                st.exception(e)
-                st.stop()
+                st.exception(e); st.stop()
     st.stop()
 
 _ensure_index()
 
-# --------- Load data/index ----------
+# ---------- Load ----------
 @st.cache_resource
 def _load_everything():
     df = load_df()
@@ -40,78 +40,123 @@ def _load_everything():
 
 df, index, metas, chunks = _load_everything()
 
-# --------- Controls ----------
-query = st.text_input("Search topic (e.g., “artificial intelligence”, “climate finance”)", "")
-col1, col2 = st.columns(2)
-years = sorted(df["date"].dt.year.unique().tolist())
-if not years:
-    st.error("No dates found in your dataset.")
+# ---------- Sidebar controls ----------
+with st.sidebar:
+    st.header("Search Controls")
+    query = st.text_input("Topic", placeholder="e.g., artificial intelligence, climate finance")
+    years = sorted(df["date"].dt.year.unique().tolist())
+    if years:
+        date_from = st.date_input("From", min_value=df["date"].min().date(),
+                                  value=df["date"].min().date())
+        date_to = st.date_input("To", max_value=df["date"].max().date(),
+                                value=df["date"].max().date())
+    else:
+        date_from = date_to = None
+
+    sort = st.radio("Sort by", ["Relevance", "Newest"], horizontal=True)
+    view_mode = st.radio("LLM Mode", ["Speed", "Depth"], help="Speed: faster/cheaper. Depth: more context & higher-quality model.", horizontal=True)
+
+    # Pagination
+    page_size = st.selectbox("Results per page", [10, 20, 30], index=1)
+    if "page_offset" not in st.session_state:
+        st.session_state.page_offset = 0
+
+    # Saved searches (session)
+    st.divider()
+    st.subheader("Saved Searches")
+    saved = st.session_state.get("saved_searches", [])
+    if st.button("⭐ Save current"):
+        if query.strip():
+            saved.append({"q": query.strip(), "from": str(date_from), "to": str(date_to), "sort": sort})
+            st.session_state["saved_searches"] = saved
+    for i, s in enumerate(saved):
+        if st.button(f"Load: {s['q']} ({s['from']}→{s['to']}, {s['sort']})"):
+            query = s["q"]
+            date_from = _dt.date.fromisoformat(s["from"])
+            date_to = _dt.date.fromisoformat(s["to"])
+            sort = s["sort"]
+
+# Optional theme facet
+theme_col = "new_themes" if "new_themes" in df.columns else ("themes" if "themes" in df.columns else None)
+all_themes = sorted({t for lst in (df[theme_col] if theme_col else []) for t in (lst if isinstance(lst, list) else [])}) if theme_col else []
+theme_filter = st.multiselect("Filter by theme (optional)", all_themes, help="Click to filter results to these themes.")
+
+filters = {
+    "themes": theme_filter,
+    "date_from": date_from,
+    "date_to": date_to
+}
+
+# ---------- Run retrieval ----------
+if not query or not query.strip():
+    st.info("Enter a topic in the sidebar to begin.")
     st.stop()
-default_b = min(1, len(years)-1) if len(years) > 1 else 0
-year_a = col1.selectbox("Year A", years, index=0)
-year_b = col2.selectbox("Year B", years, index=default_b)
 
-# Optional theme filter
-if ("new_themes" in df.columns) or ("themes" in df.columns):
-    all_themes = sorted({t for lst in df.get("new_themes", df.get("themes", [])) for t in (lst if isinstance(lst, list) else [])})
-else:
-    all_themes = []
-theme_filter = st.multiselect("Theme (optional)", all_themes, default=[])
-filters = {"themes": theme_filter} if theme_filter else {}
+sort_key = "newest" if sort == "Newest" else "relevance"
+limit = page_size
+offset = st.session_state.page_offset
 
-# --------- Retrieval ----------
-def _date_key(meta_date):
-    try:
-        return _dt.datetime.fromisoformat(str(meta_date))
-    except Exception:
-        return _dt.datetime.min
+hits, total = retrieve(query, index, metas, chunks, k=100, filters=filters, sort=sort_key, offset=offset, limit=limit)
+st.caption(f"Showing {len(hits)} of {total} results — page {offset//limit + 1}")
 
-if query.strip():
-    hits = retrieve(query, index, metas, chunks, k=24, filters=filters)
-    hits = sorted(hits, key=lambda t: _date_key(t[1].get("date","")), reverse=True)
-    st.caption(f"Retrieved {len(hits)} results (deduped to one best chunk per speech).")
-else:
-    st.info("Enter a topic to begin.")
-    st.stop()
+# Pagination buttons
+c1, c2, c3 = st.columns([1,1,6])
+with c1:
+    if st.button("◀ Prev", disabled=offset==0):
+        st.session_state.page_offset = max(0, offset - limit)
+        st.rerun()
+with c2:
+    if st.button("Next ▶", disabled=offset + limit >= total):
+        st.session_state.page_offset = offset + limit
+        st.rerun()
 
-# Group for Quick Compare
-year_a_hits = [(i,m,c) for (i,m,c) in hits if int(m.get("year", 0)) == int(year_a)]
-year_b_hits = [(i,m,c) for (i,m,c) in hits if int(m.get("year", 0)) == int(year_b)]
+# ---------- Tabs ----------
+tab_res, tab_compare, tab_quotes, tab_brief, tab_viz = st.tabs(
+    ["Results", "Quick Compare", "Top Quotes", "Briefing Pack", "Analytics"]
+)
 
-# Helper: format chunks with headers so LLM can cite
-def _format_hits_for_context(hit_list, limit=12, char_limit=900):
-    """
-    Each item becomes:
-    [YYYY-MM-DD — Title](link)
-    excerpt...
-    """
-    out = []
-    used = set()
-    for (idx, m, ch) in hit_list[:limit]:
-        key = (m.get("date"), m.get("title"))
-        if key in used:
-            continue
-        used.add(key)
-        header = f"[{m.get('date')} — {m.get('title')}]({m.get('link')})"
-        excerpt = textwrap.shorten((ch or "").replace("\n", " "), width=char_limit, placeholder="…")
-        out.append(header + "\n" + excerpt)
-    return "\n\n".join(out) if out else "(no matching context)"
+# Model choice / context size
+model = "gpt-4o" if view_mode == "Depth" else "gpt-4o-mini"
+ctx_limit = 18 if view_mode == "Depth" else 10
 
-# --------- Thematic Quick Compare (LLM) ----------
-st.header("Quick Compare — Thematic, LLM-written")
-if not year_a_hits and not year_b_hits:
-    st.warning("No retrieved content for either selected year with this query. Try removing the Theme filter or broadening your query.")
-else:
-    ctx_a = _format_hits_for_context(year_a_hits, limit=12)
-    ctx_b = _format_hits_for_context(year_b_hits, limit=12)
+# ---------- Results tab ----------
+with tab_res:
+    st.subheader("Most Relevant Speeches" if sort_key=="relevance" else "Most Recent Speeches")
+    for (_, m, ch) in hits:
+        st.markdown(f"**{m.get('date')} — [{m.get('title')}]({m.get('link')})**")
+        # LLM snippet + bullets
+        sys = "You are an IMF speech analyst. Produce a concise snippet and 3–5 bullets grounded only in the excerpt."
+        usr = f"Excerpt:\n{ch}\n\nReturn a 1–2 sentence snippet, then 3–5 bullets of key points."
+        md = llm(sys, usr, model=model, max_tokens=450, temperature=0.3)
+        st.markdown(md)
+    with st.expander("Show sources used on this page"):
+        for (d,t,l) in sources_from_hits(hits):
+            st.markdown(f"- {d} — [{t}]({l})")
 
-    system = (
-        "You are a senior IMF communications strategist. "
-        "Using ONLY the provided context, write issue-focused analysis that is precise, sober, and media-ready. "
-        "Focus on substance (policies, rationales, risks, instruments), not keywords. Avoid speculation. "
-        "When you reference a point, add (Month YYYY — Title) right after it using the bracket headers."
-    )
-    user = f"""
+# ---------- Quick Compare tab ----------
+with tab_compare:
+    st.subheader("Thematic Quick Compare (LLM)")
+    years_avail = sorted(df["date"].dt.year.unique())
+    colA, colB = st.columns(2)
+    year_a = colA.selectbox("Year A", years_avail, index=0)
+    year_b = colB.selectbox("Year B", years_avail, index=min(1, len(years_avail)-1))
+
+    # Make year-specific contexts from the CURRENT (filtered) result universe
+    year_a_hits = [h for h in hits if int(h[1].get("year",0)) == int(year_a)]
+    year_b_hits = [h for h in hits if int(h[1].get("year",0)) == int(year_b)]
+
+    def _context(hlist, limit=ctx_limit):
+        return format_hits_for_context(hlist, limit=limit, char_limit=900)
+
+    ctx_a = _context(year_a_hits)
+    ctx_b = _context(year_b_hits)
+
+    if not year_a_hits and not year_b_hits:
+        st.warning("No matching content for these years with current filters.")
+    else:
+        sys = ("You are a senior IMF comms strategist. Using ONLY the provided context, write issue-focused analysis. "
+               "Be concrete, policy-aware, and concise. Add (Month YYYY — Title) after points using the headers.")
+        usr = f"""
 Topic: {query}
 
 Year {year_a} context:
@@ -121,47 +166,107 @@ Year {year_b} context:
 {ctx_b}
 
 Tasks:
-1) For {year_a}: list 4–6 **issue** headings with 1–2 sentence summaries each (no quotes). Keep it concise and substantive.
-2) For {year_b}: list 4–6 **issue** headings with 1–2 sentence summaries each (no quotes).
-3) **Messaging evolution**: a short, concrete narrative describing what gained emphasis, what was deemphasized, and any **new issues** that emerged. Reference specific speeches using (Month YYYY — Title).
-Return clean Markdown with three sections: "{year_a} Focus", "{year_b} Focus", "Messaging Evolution".
+1) For {year_a}: list 4–6 issue headings with 1–2 sentence summaries each (no quotes).
+2) For {year_b}: list 4–6 issue headings with 1–2 sentence summaries each (no quotes).
+3) Messaging evolution: a short narrative on what gained emphasis, what was deemphasized, and any new issues. Cite headers as (Month YYYY — Title).
 """
-    cmp_md = llm(system, user, model="gpt-4o-mini", max_tokens=900, temperature=0.3)
-    st.markdown(cmp_md)
+        cmp_md = llm(sys, usr, model=model, max_tokens=900, temperature=0.3)
+        st.markdown(cmp_md)
 
-# --------- Top Quotes (LLM) ----------
-st.header("Top Quotes (LLM)")
-system_q = (
-    "You are extracting quotes for media use. Use ONLY the provided context; return exact sentences. "
-    "Each bullet must end with (Month YYYY — Title) and include the link from the header."
-)
-user_q = f"""
+    with st.expander("Show sources (Quick Compare)"):
+        src = sources_from_hits(year_a_hits + year_b_hits)
+        for (d,t,l) in src:
+            st.markdown(f"- {d} — [{t}]({l})")
+
+# ---------- Top Quotes tab ----------
+with tab_quotes:
+    st.subheader("Top Quotes (LLM)")
+    # Ensure we pass enough context but dedup speeches
+    sys = ("You extract on-topic quotes. Use ONLY provided context; return exact sentences. "
+           "Each bullet ends with (Month YYYY — Title) and includes the link from the header. "
+           "Prioritize quotes that clearly address the user's topic.")
+    usr = f"""
 Topic: {query}
 
 Context:
-{_format_hits_for_context(hits, limit=16)}
+{format_hits_for_context(hits, limit=ctx_limit+4)}
 
 Task:
-Return the 5 strongest, most on-topic quotes (1–3 sentences each). Each bullet ends with (Month YYYY — Title).
+Return exactly 5 strong on-topic quotes (1–3 sentences each). Each bullet ends with (Month YYYY — Title).
 """
-quotes_md = llm(system_q, user_q, model="gpt-4o-mini", max_tokens=700, temperature=0.3)
-st.markdown(quotes_md)
+    quotes_md = llm(sys, usr, model=model, max_tokens=700, temperature=0.2)
+    st.markdown(quotes_md)
+    with st.expander("Show sources (Quotes)"):
+        for (d,t,l) in sources_from_hits(hits):
+            st.markdown(f"- {d} — [{t}]({l})")
 
-# --------- Briefing Pack (LLM) ----------
-st.header("Briefing Pack (LLM)")
-system_b = "You are drafting a comms briefing. Use only the provided context and keep it concise and media-ready."
-user_b = f"""
+# ---------- Briefing Pack tab ----------
+with tab_brief:
+    st.subheader("Briefing Pack (LLM)")
+    sys = "You are drafting a media-ready briefing grounded ONLY in provided context."
+    usr = f"""
 Topic: {query}
 
 Context:
-{_format_hits_for_context(hits, limit=18)}
+{format_hits_for_context(hits, limit=ctx_limit+6)}
 
 Tasks:
 - Executive summary (3–5 bullets).
-- 5 key issues with 1–2 sentence summaries each (no quotes).
-- 5 strongest quotes (with Month YYYY — Title).
-- Short timeline bullets (Month YYYY — Title) of notable remarks.
-Return clean Markdown (no extras).
+- Five key issues (1–2 sentence summaries each; no quotes).
+- Five strongest quotes (with Month YYYY — Title).
+- Short timeline bullets (Month YYYY — Title).
+Return clean Markdown.
 """
-brief_md = llm(system_b, user_b, model="gpt-4o-mini", max_tokens=1200, temperature=0.3)
-st.markdown(brief_md)
+    brief_md = llm(sys, usr, model=model, max_tokens=1200, temperature=0.3)
+    st.markdown(brief_md)
+
+    # Simple download as Markdown
+    st.download_button("Download briefing (Markdown)", brief_md.encode("utf-8"), file_name="briefing.md", mime="text/markdown")
+
+# ---------- Analytics tab (visuals) ----------
+with tab_viz:
+    st.subheader("Analytics & Visuals")
+
+    # Build a tiny frame of *returned* results for charts (not entire corpus)
+    viz_rows = []
+    for (_, m, _ch) in hits:
+        viz_rows.append({
+            "date": m.get("date"),
+            "year": int(str(m.get("date"))[:4]) if m.get("date") else None,
+            "title": m.get("title"),
+            "link": m.get("link"),
+            "themes": ", ".join(m.get("themes") or [])
+        })
+    vdf = pd.DataFrame(viz_rows)
+    if not vdf.empty:
+        vdf["date"] = pd.to_datetime(vdf["date"], errors="coerce")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.caption("Timeline of matching speeches")
+            tl = vdf.sort_values("date")
+            fig = px.scatter(tl, x="date", y=[1]*len(tl), hover_data=["title","themes"], labels={"y":""})
+            fig.update_yaxes(visible=False, showticklabels=False)
+            st.plotly_chart(fig, use_container_width=True)
+
+        with c2:
+            st.caption("Speeches by year (current result set)")
+            year_ct = vdf.groupby("year")["title"].count().reset_index(name="speeches")
+            fig2 = px.bar(year_ct.sort_values("year"), x="year", y="speeches")
+            st.plotly_chart(fig2, use_container_width=True)
+
+        if theme_col:
+            st.caption("Top themes in current results")
+            # explode themes for counting
+            explode = []
+            for (_, m, _ch) in hits:
+                for t in (m.get("themes") or []):
+                    explode.append({"theme": t})
+            tdf = pd.DataFrame(explode)
+            if not tdf.empty:
+                top_t = tdf["theme"].value_counts().reset_index()
+                top_t.columns = ["theme","count"]
+                fig3 = px.bar(top_t.head(15), x="theme", y="count")
+                st.plotly_chart(fig3, use_container_width=True)
+    else:
+        st.info("No data to chart yet — adjust your query or date range.")
