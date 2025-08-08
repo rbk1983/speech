@@ -48,4 +48,41 @@ def main():
     texts, metas = [], []
     for i, r in df.iterrows():
         meta = {
-            "speech_id_
+            "speech_id": int(i),
+            "title": r.get("title", "(untitled)"),
+            "date": str(pd.to_datetime(r["date"]).date()),
+            "year": int(pd.to_datetime(r["date"]).year),
+            "link": r.get("link", ""),
+            "themes": r.get("new_themes", r.get("themes", [])) or [],
+            "location": r.get("location", "") or ""
+        }
+        for ch in chunk_text(r.get("transcript", ""), enc):
+            texts.append(ch)
+            metas.append(meta)
+
+    if not texts:
+        raise SystemExit("No transcript content found to index.")
+
+    # Embed in batches
+    BATCH = 128
+    vecs = []
+    for j in range(0, len(texts), BATCH):
+        batch = texts[j:j+BATCH]
+        resp = client.embeddings.create(model="text-embedding-3-large", input=batch)
+        vecs.extend([d.embedding for d in resp.data])
+
+    vecs = np.array(vecs, dtype="float32")
+    faiss.normalize_L2(vecs)
+    index = faiss.IndexFlatIP(vecs.shape[1])
+    index.add(vecs)
+
+    faiss.write_index(index, INDEX_PATH)
+    with open(META_PATH, "w", encoding="utf-8") as f:
+        json.dump({"metas": metas}, f)
+    with open(CHUNKS_PATH, "w", encoding="utf-8") as f:
+        json.dump({"chunks": texts}, f)
+
+    print(f"✅ Built {INDEX_PATH} with {len(metas)} chunks. Wrote {META_PATH} + {CHUNKS_PATH}.")
+
+if __name__ == "__main__":
+    main()
