@@ -1,0 +1,30 @@
+# messaging_playbook.yaml — starter template
+issues:
+  Climate finance:
+    target: 0.9
+    proof_points:
+      - Resilience and Sustainability Trust (RST/RSF)
+      - Mitigation and adaptation financing
+      - Climate risk management
+  Debt sustainability:
+    target: 0.8
+    proof_points:
+      - G20 Common Framework & Global Sovereign Debt Roundtable
+      - Debt Sustainability Analysis (DSA) and restructuring
+      - Fiscal discipline and reforms
+  AI & productivity:
+    target: 0.5
+    proof_points:
+      - Governance & safety
+      - Skills & inclusion
+      - Productivity gains & diffusion
+  Geoeconomic fragmentation:
+    target: 0.6
+    proof_points:
+      - Trade & supply chains
+      - Cross-border investment
+      - Multilateral cooperation
+banned_phrases:
+  - panic
+  - collapse
+  - hopeless

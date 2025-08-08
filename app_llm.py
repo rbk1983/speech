@@ -1,5 +1,5 @@
-# app_llm.py — Streamlit app with date-range Thematic Evolution, caching,
-# robust model fallback (gpt-4o-mini / gpt-4o), polished UI, and interactive visuals.
+# app_llm.py — Phase 2: Alignment, Rapid Response, Tone, Draft Assist, Stakeholders
+# Uses gpt-4o-mini / gpt-4o with fallback via rag_utils.llm, cached calls, and Plotly visuals.
 import os, datetime as _dt, hashlib
 import pandas as pd
 import streamlit as st
@@ -8,6 +8,13 @@ import plotly.express as px
 from rag_utils import (
     load_df, load_index, retrieve,
     sources_from_hits, format_hits_for_context, llm
+)
+from phase2_utils import (
+    load_playbook, load_stakeholders,
+    alignment_radar_data, alignment_narrative,
+    rapid_response_pack,
+    tone_time_series, tone_heatmap_data,
+    stakeholder_scores, stakeholder_narrative
 )
 
 st.set_page_config(page_title="Kristalina Speech Intelligence (LLM)", layout="wide")
@@ -59,11 +66,10 @@ with st.sidebar:
         min_d = max_d = _dt.date.today()
 
     date_from = st.date_input("From", min_value=min_d, value=min_d)
-    date_to = st.date_input("To", max_value=max_d, value=max_d)
+    date_to   = st.date_input("To", max_value=max_d, value=max_d)
 
     sort = st.radio("Sort by", ["Relevance", "Newest"], horizontal=True)
 
-    # LLM mode => model/limits later
     view_mode = st.radio(
         "LLM Mode",
         ["Speed", "Depth"],
@@ -93,7 +99,7 @@ with st.sidebar:
         if st.button(f"Load: {s['q']} ({s['from']}→{s['to']}, {s['sort']}, {s['mode']})"):
             query = s["q"]
             date_from = _dt.date.fromisoformat(s["from"])
-            date_to = _dt.date.fromisoformat(s["to"])
+            date_to   = _dt.date.fromisoformat(s["to"])
             sort = s["sort"]
             view_mode = s["mode"]
 
@@ -105,29 +111,26 @@ theme_filter = st.multiselect("Filter by theme (optional)", all_themes, help="Cl
 filters = {"themes": theme_filter, "date_from": date_from, "date_to": date_to}
 
 # ---------------- Model choice / context limits ----------------
-# Use widely-available models to avoid BadRequest: gpt-4o-mini (Speed) and gpt-4o (Depth).
 if view_mode == "Depth":
-    model_preferred = "gpt-4o"      # higher quality, broadly available
-    ctx_limit = 12                   # how many items to include in LLM context sections
+    model_preferred = "gpt-4o"
+    ctx_limit = 12
     per_item_tokens = 950
 else:
-    model_preferred = "gpt-4o-mini" # faster & cheaper, broadly available
+    model_preferred = "gpt-4o-mini"
     ctx_limit = 8
     per_item_tokens = 650
 
-# ---------------- Cached LLM wrapper with model badge ----------------
+# ---------------- Cached LLM wrapper that returns (text, model_used) ----------------
 @st.cache_data(show_spinner=False)
 def llm_cached(cache_key: str, system: str, user: str, model: str, max_tokens: int, temperature: float):
-    """Call llm() and return (text, model_used). Works even if rag_utils.llm returns just text."""
     _ = hashlib.sha256((cache_key + system + user + model + str(max_tokens) + str(temperature)).encode("utf-8")).hexdigest()
     try:
         resp = llm(system, user, model=model, max_tokens=max_tokens, temperature=temperature)
         if isinstance(resp, tuple) and len(resp) == 2:
-            return resp  # (text, model_used)
+            return resp
         else:
             return (resp, model)
     except Exception:
-        # Try one fallback then re-raise
         fb = "gpt-4o-mini" if model != "gpt-4o-mini" else "gpt-4o"
         resp = llm(system, user, model=fb, max_tokens=max_tokens, temperature=temperature)
         if isinstance(resp, tuple) and len(resp) == 2:
@@ -160,8 +163,9 @@ with c2:
         st.session_state.page_offset = offset + limit; st.rerun()
 
 # ---------------- Tabs ----------------
-tab_res, tab_compare, tab_quotes, tab_brief, tab_viz = st.tabs(
-    ["Results", "Thematic Evolution", "Top Quotes", "Briefing Pack", "Analytics"]
+tab_res, tab_compare, tab_quotes, tab_brief, tab_viz, tab_align, tab_rr, tab_tone, tab_draft, tab_stake = st.tabs(
+    ["Results", "Thematic Evolution", "Top Quotes", "Briefing Pack", "Analytics",
+     "Alignment", "Rapid Response", "Tone", "Draft Assist", "Stakeholders"]
 )
 
 # ---------------- Results tab ----------------
@@ -179,7 +183,7 @@ with tab_res:
         for (d,t,l) in sources_from_hits(hits):
             st.markdown(f"- {d} — [{t}]({l})")
 
-# ---------------- Thematic Evolution tab (single date range) ----------------
+# ---------------- Thematic Evolution (single date range) ----------------
 with tab_compare:
     st.subheader("Thematic Evolution (LLM) — Date Range")
     st.caption(f"Analyzing: **{date_from.isoformat()} → {date_to.isoformat()}**")
@@ -196,7 +200,6 @@ with tab_compare:
     if not range_hits:
         st.warning("No matching content in this date range with current filters. Try broadening the range or removing theme filters.")
     else:
-        # Group by year (ascending)
         by_year = {}
         for (idx, m, ch) in range_hits:
             y = int(m.get("year", 0) or str(m.get("date",""))[:4] or 0)
@@ -204,7 +207,6 @@ with tab_compare:
             by_year.setdefault(y, []).append((idx, m, ch))
         years_asc = sorted(by_year.keys())
 
-        # Smaller per-year cap to keep prompts snappy
         per_year_limit = max(3, min(6, (12 if view_mode=="Depth" else 8) // max(1, len(years_asc))))
         year_sections = []
         for y in years_asc:
@@ -213,7 +215,6 @@ with tab_compare:
                 year_sections.append(f"=== Year {y} ===\n{ctx}")
         full_ctx = "\n\n".join(year_sections) if year_sections else "(no matching context)"
 
-        # 1) Per-Year Focus
         sys1 = ("You are a senior IMF communications strategist. Using ONLY the provided context, "
                 "produce issue-focused yearly summaries. Focus on substance; avoid speculation. "
                 "Add (Month YYYY — Title) from headers when referencing specifics.")
@@ -232,7 +233,6 @@ Task: For each year in the range, list 3–5 ISSUE headings with 1–2 sentence 
         st.markdown(per_year_md)
         st.caption(f"Model: {used_model1}")
 
-        # 2) Evolution Narrative
         sys2 = ("You analyze evolution across the full date range. Use ONLY context. "
                 "Be concrete: what gained emphasis, what was deemphasized, any NEW issues. "
                 "Cite with (Month YYYY — Title) based on headers.")
@@ -345,3 +345,98 @@ with tab_viz:
                 st.plotly_chart(fig3, use_container_width=True)
     else:
         st.info("No data to chart yet — adjust your query or date range.")
+
+# ---------------- Alignment tab ----------------
+with tab_align:
+    st.subheader("Message Consistency & Alignment")
+    playbook = load_playbook()
+    # Build compact context from current hits
+    ctx = format_hits_for_context(hits_for_llm, limit=(ctx_limit+2))
+
+    # Radar data + narrative
+    radar_df = alignment_radar_data(query, playbook, ctx, model_preferred)
+    if radar_df is not None and not radar_df.empty:
+        fig = px.line_polar(radar_df, r="score", theta="issue", line_close=True)
+        fig.update_traces(fill='toself')
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("No issues detected for radar. Try widening the date range or query.")
+
+    nar = alignment_narrative(query, playbook, ctx, model_preferred)
+    st.markdown(nar)
+
+# ---------------- Rapid Response tab ----------------
+with tab_rr:
+    st.subheader("Rapid Response")
+    colh1, colh2 = st.columns(2)
+    headline = colh1.text_input("Paste headline or topic", "")
+    url_hint = colh2.text_input("Optional: related URL (for context note only)", "")
+    if st.button("Generate Press Lines"):
+        ctx = format_hits_for_context(hits_for_llm, limit=(ctx_limit+4))
+        pack_md = rapid_response_pack(headline or query, ctx, model_preferred, url_hint=url_hint)
+        st.markdown(pack_md)
+        st.download_button("Download rapid-response (Markdown)", pack_md.encode("utf-8"), file_name="rapid_response.md", mime="text/markdown")
+
+# ---------------- Tone tab ----------------
+with tab_tone:
+    st.subheader("Sentiment & Tone")
+    ctx = format_hits_for_context(hits_for_llm, limit=(ctx_limit+6))
+    ts = tone_time_series(query, ctx, model_preferred)
+    if not ts.empty:
+        fig = px.line(ts, x="date", y="score", color="tone", markers=True)
+        st.plotly_chart(fig, use_container_width=True)
+    hm = tone_heatmap_data(query, ctx, model_preferred)
+    if not hm.empty:
+        fig2 = px.imshow(hm.pivot_table(index="tone", columns="year", values="score", fill_value=0),
+                         aspect="auto", color_continuous_scale="Blues")
+        st.plotly_chart(fig2, use_container_width=True)
+
+# ---------------- Draft Assist tab ----------------
+with tab_draft:
+    st.subheader("First Draft Speech Assist")
+    a1, a2, a3 = st.columns(3)
+    audience = a1.text_input("Audience", "Finance ministers")
+    venue    = a2.text_input("Venue", "Annual Meetings")
+    tone     = a3.selectbox("Tone", ["Balanced", "Optimistic", "Urgent", "Cautious"], index=0)
+    length   = st.slider("Length (minutes)", 5, 30, 12)
+    objectives = st.text_input("Top 3 objectives (comma-separated)", "Reassure markets, Highlight reforms, Call for cooperation")
+
+    if st.button("Draft outline"):
+        ctx = format_hits_for_context(hits_for_llm, limit=(ctx_limit+6))
+        sys = "You are drafting a first-pass speech outline in the speaker's established style, grounded ONLY in provided context."
+        usr = f"""
+Context (date-ordered excerpts):
+{ctx}
+
+Audience: {audience}
+Venue: {venue}
+Tone: {tone}
+Length: {length} minutes
+Objectives: {objectives}
+
+Tasks:
+- Title and 1–2 sentence setup
+- Outline with sections and 2–3 bullets each (grounded in context)
+- 8–10 pull quotes with (Month YYYY — Title)
+- Closing paragraph
+Return clean Markdown.
+"""
+        key = f"draft::{query}::{audience}::{venue}::{tone}::{length}"
+        (md, used_model) = llm_cached(key, sys, usr, model=model_preferred, max_tokens=1200, temperature=0.3)
+        st.markdown(md)
+        st.caption(f"Model: {used_model}")
+        st.download_button("Download draft (Markdown)", md.encode("utf-8"), file_name="speech_draft.md", mime="text/markdown")
+
+# ---------------- Stakeholders tab ----------------
+with tab_stake:
+    st.subheader("Stakeholder Relevance")
+    stakeholders = load_stakeholders()
+    ctx = format_hits_for_context(hits_for_llm, limit=(ctx_limit+4))
+    scores = stakeholder_scores(query, stakeholders, ctx, model_preferred)  # returns DataFrame
+    if not scores.empty:
+        fig = px.bar(scores, x="stakeholder", y="score")
+        st.plotly_chart(fig, use_container_width=True)
+        nar = stakeholder_narrative(query, stakeholders, ctx, model_preferred)
+        st.markdown(nar)
+    else:
+        st.info("No clear stakeholder mapping detected—try a broader query or range.")

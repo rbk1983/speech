@@ -1,0 +1,27 @@
+# stakeholders.yaml — starter template
+stakeholders:
+  Investors:
+    - market confidence
+    - liquidity
+    - risk premium
+    - inflation/interest rates
+  EM Policymakers:
+    - fiscal space
+    - structural reforms
+    - debt restructuring
+    - concessional finance
+  EU Policymakers:
+    - single market
+    - green transition
+    - competitiveness
+    - resilience
+  Civil Society:
+    - poverty
+    - social protection
+    - inclusion
+    - governance
+  Youth:
+    - jobs
+    - skills
+    - digital
+    - entrepreneurship
