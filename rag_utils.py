@@ -133,7 +133,7 @@ def format_hits_for_context(hits, limit=12, char_limit=900):
         out.append(head + "\n" + excerpt)
     return "\n\n".join(out) if out else "(no matching context)"
 
-def llm(system_prompt, user_prompt, model="gpt-4o-mini", max_tokens=900, temperature=0.3):
+def llm(system_prompt, user_prompt, model="gpt-5-mini", max_tokens=900, temperature=0.3):
     resp = _client.chat.completions.create(
         model=model,
         messages=[
