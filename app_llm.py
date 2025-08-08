@@ -1,10 +1,8 @@
-# app_llm.py — Phase 3 Step 1: Messaging Trajectory + Alignment Score
-# Builds on Phase 2: Alignment, Rapid Response, Tone, Draft Assist, Stakeholders
+# app_llm.py — Phase 2 + News: Alignment, Rapid Response with Google News RSS, Tone, Draft Assist, Stakeholders
 import os, datetime as _dt, hashlib
 import pandas as pd
 import streamlit as st
 import plotly.express as px
-import plotly.graph_objects as go
 
 from rag_utils import (
     load_df, load_index, retrieve,
@@ -17,10 +15,7 @@ from phase2_utils import (
     tone_time_series, tone_heatmap_data,
     stakeholder_scores, stakeholder_narrative
 )
-from phase3_utils import (
-    issues_time_series, forecast_issues, trajectory_narrative,
-    alignment_score_value
-)
+from news_utils import fetch_news, rank_news_by_query
 
 st.set_page_config(page_title="Kristalina Speech Intelligence (LLM)", layout="wide")
 st.title("Kristalina Georgieva — Speech Intelligence")
@@ -168,9 +163,9 @@ with c2:
         st.session_state.page_offset = offset + limit; st.rerun()
 
 # ---------------- Tabs ----------------
-tab_res, tab_compare, tab_quotes, tab_brief, tab_viz, tab_align, tab_rr, tab_tone, tab_draft, tab_stake, tab_traj = st.tabs(
+tab_res, tab_compare, tab_quotes, tab_brief, tab_viz, tab_align, tab_rr, tab_tone, tab_draft, tab_stake = st.tabs(
     ["Results", "Thematic Evolution", "Top Quotes", "Briefing Pack", "Analytics",
-     "Alignment", "Rapid Response", "Tone", "Draft Assist", "Stakeholders", "Trajectory"]
+     "Alignment", "Rapid Response", "Tone", "Draft Assist", "Stakeholders"]
 )
 
 # ---------------- Results tab ----------------
@@ -302,7 +297,7 @@ Return clean Markdown.
     (brief_md, used_model4) = llm_cached(f"brief::{query}::{date_from}::{date_to}::{model_preferred}", sys_b, usr_b, model=model_preferred, max_tokens=per_item_tokens+200, temperature=0.25)
     st.markdown(brief_md)
     st.caption(f"Model: {used_model4}")
-    st.download_button("Download briefing (Markdown)", brief_md.encode("utf-8"), file_name="speech_draft.md", mime="text/markdown")
+    st.download_button("Download briefing (Markdown)", brief_md.encode("utf-8"), file_name="briefing.md", mime="text/markdown")
 
 # ---------------- Analytics tab (visuals) ----------------
 with tab_viz:
@@ -351,78 +346,94 @@ with tab_viz:
     else:
         st.info("No data to chart yet — adjust your query or date range.")
 
-# ---------------- Alignment tab (score + radar/bar) ----------------
+# ---------------- Alignment tab ----------------
 with tab_align:
     st.subheader("Message Consistency & Alignment")
     playbook = load_playbook()
     ctx = format_hits_for_context(hits_for_llm, limit=(ctx_limit+2))
 
-    # Numeric Alignment Score (0..100)
-    score = alignment_score_value(query, playbook, ctx, model_preferred)
-    colg1, colg2 = st.columns([1,3])
-    with colg1:
-        if score is not None:
-            fig_g = go.Figure(go.Indicator(
-                mode="gauge+number",
-                value=score,
-                number={'suffix': "%"},
-                gauge={'axis': {'range': [0, 100]},
-                       'bar': {'color': "#2e7d32"},
-                       'steps': [
-                           {'range': [0, 60], 'color': '#ffebee'},
-                           {'range': [60, 80], 'color': '#fff3e0'},
-                           {'range': [80, 100], 'color': '#e8f5e9'}],
-                       },
-                title={'text': "Alignment Score"}
-            ))
-            st.plotly_chart(fig_g, use_container_width=True)
-        else:
-            st.info("Alignment score unavailable for this selection.")
-
-    # Radar or bar fallback
     radar_df = alignment_radar_data(query, playbook, ctx, model_preferred)
-    with colg2:
-        if radar_df is not None and not radar_df.empty and len(radar_df) >= 3 and "issue" in radar_df and "score" in radar_df:
-            try:
-                fig = px.line_polar(radar_df, r="score", theta="issue", line_close=True)
-                fig.update_traces(fill='toself')
-                st.plotly_chart(fig, use_container_width=True)
-            except Exception:
-                figb = px.bar(radar_df, x="issue", y="score")
-                st.plotly_chart(figb, use_container_width=True)
-        elif radar_df is not None and not radar_df.empty:
-            figb = px.bar(radar_df, x="issue", y="score")
-            st.plotly_chart(figb, use_container_width=True)
-        else:
-            st.info("No issues detected for radar/bar. Try widening the date range or query.")
+    if radar_df is not None and not radar_df.empty and {"issue","score"}.issubset(radar_df.columns) and len(radar_df) >= 3:
+        fig = px.line_polar(radar_df, r="score", theta="issue", line_close=True)
+        fig.update_traces(fill='toself')
+        st.plotly_chart(fig, use_container_width=True)
+    elif radar_df is not None and not radar_df.empty and {"issue","score"}.issubset(radar_df.columns):
+        st.caption("Not enough issues for radar — showing bars instead.")
+        fig = px.bar(radar_df, x="issue", y="score")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("No issues detected for alignment. Try widening the date range or query.")
 
     nar = alignment_narrative(query, playbook, ctx, model_preferred)
     st.markdown(nar if isinstance(nar, str) else (nar[0] if isinstance(nar, tuple) else ""))
 
-# ---------------- Rapid Response tab ----------------
+# ---------------- Rapid Response tab (with Google News) ----------------
 with tab_rr:
-    st.subheader("Rapid Response")
-    colh1, colh2 = st.columns(2)
-    headline = colh1.text_input("Paste headline or topic", "")
-    url_hint = colh2.text_input("Optional: related URL (for context note only)", "")
-    if st.button("Generate Press Lines"):
-        ctx = format_hits_for_context(hits_for_llm, limit=(ctx_limit+4))
-        pack_md = rapid_response_pack(headline or query, ctx, model_preferred, url_hint=url_hint)
-        st.markdown(pack_md if isinstance(pack_md, str) else (pack_md[0] if isinstance(pack_md, tuple) else ""))
-        st.download_button("Download rapid-response (Markdown)", (pack_md if isinstance(pack_md, str) else pack_md[0]).encode("utf-8"), file_name="rapid_response.md", mime="text/markdown")
+    st.subheader("Rapid Response — Live News")
+    cA, cB, cC = st.columns([1,1,2])
+    lookback = cA.selectbox("Look back", [6, 12, 24, 48, 72], index=2, help="Hours")
+    auto_rank = cB.checkbox("Rank by relevance", True, help="Semantic match to your topic")
+    if cC.button("Fetch live news"):
+        with st.spinner("Fetching Google News RSS…"):
+            items = fetch_news(query or "IMF", since_hours=int(lookback), limit=20)
+            if auto_rank:
+                items = rank_news_by_query(query or "IMF", items, top_k=10)
+            st.session_state["news_items"] = items
+
+    items = st.session_state.get("news_items", [])
+    if items:
+        st.caption("Select stories to generate tailored press lines:")
+        sel = []
+        for i, it in enumerate(items):
+            label = f"{(it.get('published_at') or '')[:10]} — {it['title']} ({it.get('source','')})"
+            if st.checkbox(label, key=f"news_{i}"):
+                sel.append(it)
+            st.write(f"[Read]({it['url']})")
+            if it.get("summary"):
+                st.caption(it["summary"][:240] + ("…" if len(it["summary"])>240 else ""))
+        if st.button("Generate press lines from selected"):
+            if not sel:
+                st.warning("Pick one or more stories first.")
+            else:
+                ctx = format_hits_for_context(hits_for_llm, limit=(ctx_limit+6))
+                news_md = "\n".join([f"- {s.get('published_at','')} — {s['title']} — {s.get('url','')}" for s in sel])
+                sys = ("You write rapid-response lines consistent with historic remarks. "
+                       "Use ONLY the provided speech context and the selected headlines. "
+                       "No speculation. If facts are unclear, say we are assessing.")
+                usr = f"""Topic: {query}
+
+Speech context (ground truth):
+{ctx}
+
+Selected headlines:
+{news_md}
+
+Tasks:
+- 3–4 press lines (one sentence each), grounded in both context and headlines.
+- 3 concrete policy specifics (bulleted) with (Month YYYY — Title) from context.
+- 3 reporter Q&As (Q + short A grounded in context).
+Return clean Markdown.
+"""
+                key = "rr_news::" + hashlib.sha256((query+news_md).encode("utf-8")).hexdigest()
+                (pack_md, used_model) = llm_cached(key, sys, usr, model=model_preferred, max_tokens=900, temperature=0.2)
+                st.markdown(pack_md)
+                st.caption(f"Model: {used_model}")
+                st.download_button("Download rapid-response (Markdown)", pack_md.encode("utf-8"), file_name="rapid_response.md", mime="text/markdown")
+    else:
+        st.info("Click **Fetch live news** to pull recent headlines via Google News RSS.")
 
 # ---------------- Tone tab ----------------
 with tab_tone:
     st.subheader("Sentiment & Tone")
     ctx = format_hits_for_context(hits_for_llm, limit=(ctx_limit+6))
     ts = tone_time_series(query, ctx, model_preferred)
-    if isinstance(ts, pd.DataFrame) and not ts.empty:
+    if not ts.empty:
         fig = px.line(ts, x="date", y="score", color="tone", markers=True)
         st.plotly_chart(fig, use_container_width=True)
     hm = tone_heatmap_data(query, ctx, model_preferred)
-    if isinstance(hm, pd.DataFrame) and not hm.empty:
-        pt = hm.pivot_table(index="tone", columns="year", values="score", fill_value=0)
-        fig2 = px.imshow(pt, aspect="auto", color_continuous_scale="Blues")
+    if not hm.empty:
+        fig2 = px.imshow(hm.pivot_table(index="tone", columns="year", values="score", fill_value=0),
+                         aspect="auto", color_continuous_scale="Blues")
         st.plotly_chart(fig2, use_container_width=True)
 
 # ---------------- Draft Assist tab ----------------
@@ -457,57 +468,20 @@ Return clean Markdown.
 """
         key = f"draft::{query}::{audience}::{venue}::{tone}::{length}"
         (md, used_model) = llm_cached(key, sys, usr, model=model_preferred, max_tokens=1200, temperature=0.3)
-        out = md if isinstance(md, str) else (md[0] if isinstance(md, tuple) else "")
-        st.markdown(out)
+        st.markdown(md)
         st.caption(f"Model: {used_model}")
-        st.download_button("Download draft (Markdown)", out.encode("utf-8"), file_name="speech_draft.md", mime="text/markdown")
+        st.download_button("Download draft (Markdown)", md.encode("utf-8"), file_name="speech_draft.md", mime="text/markdown")
 
 # ---------------- Stakeholders tab ----------------
 with tab_stake:
     st.subheader("Stakeholder Relevance")
-    from phase2_utils import load_stakeholders
     stakeholders = load_stakeholders()
     ctx = format_hits_for_context(hits_for_llm, limit=(ctx_limit+4))
     scores = stakeholder_scores(query, stakeholders, ctx, model_preferred)  # returns DataFrame
-    if isinstance(scores, pd.DataFrame) and not scores.empty:
+    if not scores.empty:
         fig = px.bar(scores, x="stakeholder", y="score")
         st.plotly_chart(fig, use_container_width=True)
         nar = stakeholder_narrative(query, stakeholders, ctx, model_preferred)
         st.markdown(nar if isinstance(nar, str) else (nar[0] if isinstance(nar, tuple) else ""))
     else:
         st.info("No clear stakeholder mapping detected—try a broader query or range.")
-
-# ---------------- Trajectory tab ----------------
-with tab_traj:
-    st.subheader("Messaging Trajectory & Predictive Insights")
-    st.caption(f"Range: **{date_from.isoformat()} → {date_to.isoformat()}** — Topic: **{query}**")
-
-    ctx_traj = format_hits_for_context(hits_for_llm, limit=(ctx_limit+6))
-    ts_df = issues_time_series(query, ctx_traj, model_preferred)  # columns: year, issue, score
-    if isinstance(ts_df, pd.DataFrame) and not ts_df.empty:
-        # Area chart per issue over years
-        try:
-            pivot = ts_df.pivot_table(index="year", columns="issue", values="score", aggfunc="mean").fillna(0)
-            pivot = pivot.sort_index()
-            fig = px.area(pivot, x=pivot.index, y=pivot.columns)
-            fig.update_layout(xaxis_title="Year", yaxis_title="Emphasis level (0..1)")
-            st.plotly_chart(fig, use_container_width=True)
-        except Exception:
-            st.dataframe(ts_df)
-
-        # Forecast next period
-        forecast_df = forecast_issues(ts_df)  # returns DataFrame year, issue, score, kind in {"actual","forecast"}
-        if isinstance(forecast_df, pd.DataFrame) and not forecast_df.empty:
-            try:
-                figf = px.line(forecast_df, x="year", y="score", color="issue", line_dash="kind", markers=True)
-                figf.update_layout(xaxis_title="Year", yaxis_title="Emphasis")
-                st.plotly_chart(figf, use_container_width=True)
-            except Exception:
-                st.dataframe(forecast_df)
-
-        # Narrative
-        nar = trajectory_narrative(query, ts_df, forecast_df, model_preferred)
-        out = nar if isinstance(nar, str) else (nar[0] if isinstance(nar, tuple) else "")
-        st.markdown(out)
-    else:
-        st.info("Not enough on-topic content to chart trajectory. Try expanding the range or broadening the query.")
