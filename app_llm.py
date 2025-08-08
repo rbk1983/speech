@@ -1,7 +1,7 @@
 # app_llm.py — LLM app with thematic Quick Compare (issues + evolution)
 import os, textwrap, datetime as _dt
 import streamlit as st
-from rag_utils import load_df, load_index, retrieve, join_chunks, llm
+from rag_utils import load_df, load_index, retrieve, llm
 
 st.set_page_config(page_title="Kristalina Speech Intelligence (LLM)", layout="wide")
 st.title("Kristalina Georgieva — LLM Speech Intelligence")
@@ -51,7 +51,7 @@ default_b = min(1, len(years)-1) if len(years) > 1 else 0
 year_a = col1.selectbox("Year A", years, index=0)
 year_b = col2.selectbox("Year B", years, index=default_b)
 
-# Optional theme filter if column exists
+# Optional theme filter
 if ("new_themes" in df.columns) or ("themes" in df.columns):
     all_themes = sorted({t for lst in df.get("new_themes", df.get("themes", [])) for t in (lst if isinstance(lst, list) else [])})
 else:
@@ -68,11 +68,9 @@ def _date_key(meta_date):
 
 if query.strip():
     hits = retrieve(query, index, metas, chunks, k=24, filters=filters)
-    # Enforce newest-first ordering (belt & suspenders)
     hits = sorted(hits, key=lambda t: _date_key(t[1].get("date","")), reverse=True)
     st.caption(f"Retrieved {len(hits)} results (deduped to one best chunk per speech).")
 else:
-    hits, year_a_hits, year_b_hits = [], [], []
     st.info("Enter a topic to begin.")
     st.stop()
 
@@ -151,7 +149,7 @@ st.markdown(quotes_md)
 
 # --------- Briefing Pack (LLM) ----------
 st.header("Briefing Pack (LLM)")
-system_b = "You are drafting a comms briefing. Use only the provided context and keep it concise, sober, and media-ready."
+system_b = "You are drafting a comms briefing. Use only the provided context and keep it concise and media-ready."
 user_b = f"""
 Topic: {query}
 
