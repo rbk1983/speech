@@ -1,6 +1,5 @@
-# app_llm.py — Phase 2.5: Ingestion + Rapid Response (URL & Reporter Question)
-# Adds: Ingest tab for URLs, documents, audio/video; Rapid Response from URL / Reporter Question.
-import os, io, datetime as _dt, hashlib
+# app_llm.py — streamlined UI (no theme filter), newest-first by default, all results shown
+import os, datetime as _dt, hashlib
 import pandas as pd
 import streamlit as st
 import plotly.express as px
@@ -16,10 +15,16 @@ from phase2_utils import (
     tone_time_series, tone_heatmap_data,
     stakeholder_scores, stakeholder_narrative
 )
-from ingest_utils import (
-    extract_from_url, extract_from_pdf, extract_from_docx, extract_from_txt,
-    transcribe_media, normalize_record, add_records_and_rebuild
-)
+
+# Optional Phase 3 if present
+try:
+    from phase3_utils import (
+        build_issue_trajectory, forecast_issue_trends, trajectory_narrative,
+        numeric_alignment_score
+    )
+    _HAS_P3 = True
+except Exception:
+    _HAS_P3 = False
 
 st.set_page_config(page_title="Kristalina Speech Intelligence (LLM)", layout="wide")
 st.title("Kristalina Georgieva — Speech Intelligence")
@@ -31,17 +36,15 @@ def _index_files_present():
 def _ensure_index():
     if _index_files_present():
         return True
-    st.warning("Search index not found here. Build it once in this app (or use Ingest tab).")
+    st.warning("Search index not found. Build it once in this app.")
     if not os.getenv("OPENAI_API_KEY"):
-        st.error("Set OPENAI_API_KEY in Streamlit Secrets and redeploy.")
-        st.stop()
+        st.error("Set OPENAI_API_KEY in Streamlit Secrets and redeploy."); st.stop()
     if st.button("Build index now"):
         with st.spinner("Building index…"):
             try:
                 from build_index import main as build_index_main
                 build_index_main()
-                st.success("Index built. Click **Rerun** or refresh.")
-                st.stop()
+                st.success("Index built. Click **Rerun** or refresh."); st.stop()
             except Exception as e:
                 st.exception(e); st.stop()
     st.stop()
@@ -59,69 +62,45 @@ df, index, metas, chunks = _load_everything()
 
 # ---------------- Sidebar controls ----------------
 with st.sidebar:
-    st.header("Search Controls")
-    query = st.text_input("Topic", placeholder="e.g., artificial intelligence, climate finance")
+    st.header("Search")
+    query = st.text_input("Topic (required)", placeholder='e.g., "artificial intelligence" or climate finance')
 
-    # Date range
+    # Date range (optional; defaults to full corpus)
     if len(df):
         min_d = df["date"].min().date()
         max_d = df["date"].max().date()
     else:
         min_d = max_d = _dt.date.today()
 
-    date_from = st.date_input("From", min_value=min_d, value=min_d)
-    date_to   = st.date_input("To", max_value=max_d, value=max_d)
+    use_range = st.checkbox("Filter by date range", value=False)
+    if use_range:
+        date_from = st.date_input("From", min_value=min_d, value=min_d)
+        date_to   = st.date_input("To", max_value=max_d, value=max_d)
+    else:
+        date_from, date_to = min_d, max_d
 
-    sort = st.radio("Sort by", ["Relevance", "Newest"], horizontal=True)
+    sort = st.radio("Sort by", ["Relevance", "Newest"], index=1, horizontal=True)
 
+    # LLM mode => model/limits later
     view_mode = st.radio(
         "LLM Mode",
         ["Speed", "Depth"],
         help="Speed: gpt-4o-mini (smaller context). Depth: gpt-4o (more context).",
-        horizontal=True
+        horizontal=True,
+        index=0
     )
 
-    # Pagination
-    page_size = st.selectbox("Results per page", [10, 20, 30], index=1)
-    if "page_offset" not in st.session_state:
-        st.session_state.page_offset = 0
-
-    st.divider()
-    st.subheader("Saved Searches")
-    saved = st.session_state.get("saved_searches", [])
-    if st.button("⭐ Save current"):
-        if query.strip():
-            saved.append({
-                "q": query.strip(),
-                "from": str(date_from),
-                "to": str(date_to),
-                "sort": sort,
-                "mode": view_mode
-            })
-            st.session_state["saved_searches"] = saved
-    for i, s in enumerate(saved):
-        if st.button(f"Load: {s['q']} ({s['from']}→{s['to']}, {s['sort']}, {s['mode']})"):
-            query = s["q"]
-            date_from = _dt.date.fromisoformat(s["from"])
-            date_to   = _dt.date.fromisoformat(s["to"])
-            sort = s["sort"]
-            view_mode = s["mode"]
-
-# Optional theme facet
-theme_col = "new_themes" if "new_themes" in df.columns else ("themes" if "themes" in df.columns else None)
-all_themes = sorted({t for lst in (df[theme_col] if theme_col else []) for t in (lst if isinstance(lst, list) else [])}) if theme_col else []
-theme_filter = st.multiselect("Filter by theme (optional)", all_themes, help="Click to filter results to these themes.")
-
-filters = {"themes": theme_filter, "date_from": date_from, "date_to": date_to}
+# Filters only include dates now
+filters = {"date_from": date_from, "date_to": date_to}
 
 # ---------------- Model choice / context limits ----------------
 if view_mode == "Depth":
     model_preferred = "gpt-4o"
-    ctx_limit = 12
+    ctx_limit = 14
     per_item_tokens = 950
 else:
     model_preferred = "gpt-4o-mini"
-    ctx_limit = 8
+    ctx_limit = 9
     per_item_tokens = 650
 
 # ---------------- Cached LLM wrapper that returns (text, model_used) ----------------
@@ -144,37 +123,48 @@ def llm_cached(cache_key: str, system: str, user: str, model: str, max_tokens: i
 
 # ---------------- Retrieval ----------------
 if not query or not query.strip():
-    st.info("Enter a topic in the sidebar to begin.")
+    st.info("Enter a topic to begin. Tip: use quotes for phrases, e.g., “climate finance”.")
     st.stop()
 
 sort_key = "newest" if sort == "Newest" else "relevance"
-limit = page_size
-offset = st.session_state.page_offset
 
-hits, total = retrieve(query, index, metas, chunks, k=100, filters=filters, sort=sort_key, offset=offset, limit=limit)
-st.caption(f"Showing {len(hits)} of {total} results — page {offset//limit + 1}")
+# Request a large pool and render ALL results (no pagination)
+hits, total = retrieve(query, index, metas, chunks, k=1000, filters=filters, sort=sort_key, offset=0, limit=10000)
+st.caption(f"Found {total} matching speeches/chunks. Showing all results ({len(hits)} items).")
 
 # Cap how many items feed the LLM sections (for speed)
-hits_for_llm = hits[: (28 if view_mode == "Depth" else 16)]
-
-# Pagination buttons
-c1, c2, _ = st.columns([1,1,6])
-with c1:
-    if st.button("◀ Prev", disabled=offset==0):
-        st.session_state.page_offset = max(0, offset - limit); st.rerun()
-with c2:
-    if st.button("Next ▶", disabled=offset + limit >= total):
-        st.session_state.page_offset = offset + limit; st.rerun()
+hits_for_llm = hits[: (36 if view_mode == "Depth" else 20)]
 
 # ---------------- Tabs ----------------
-tab_res, tab_compare, tab_quotes, tab_brief, tab_viz, tab_align, tab_rr, tab_tone, tab_draft, tab_stake, tab_ingest = st.tabs(
-    ["Results", "Thematic Evolution", "Top Quotes", "Briefing Pack", "Analytics",
-     "Alignment", "Rapid Response", "Tone", "Draft Assist", "Stakeholders", "Ingest (+Rebuild)"]
-)
+tabs = ["Results", "Thematic Evolution", "Top Quotes", "Briefing Pack", "Analytics", "Alignment", "Rapid Response", "Tone", "Draft Assist", "Stakeholders"]
+if _HAS_P3:
+    tabs.insert(5, "Trajectory")
+tab_objs = st.tabs(tabs)
+
+# Map tabs
+tab_res   = tab_objs[0]
+tab_comp  = tab_objs[1]
+tab_quote = tab_objs[2]
+tab_brief = tab_objs[3]
+tab_viz   = tab_objs[4]
+offset_idx = 5
+if _HAS_P3:
+    tab_traj = tab_objs[5]
+    tab_align = tab_objs[6]
+    tab_rr    = tab_objs[7]
+    tab_tone  = tab_objs[8]
+    tab_draft = tab_objs[9]
+    tab_stake = tab_objs[10]
+else:
+    tab_align = tab_objs[5]
+    tab_rr    = tab_objs[6]
+    tab_tone  = tab_objs[7]
+    tab_draft = tab_objs[8]
+    tab_stake = tab_objs[9]
 
 # ---------------- Results tab ----------------
 with tab_res:
-    st.subheader("Most Relevant Speeches" if sort_key=="relevance" else "Most Recent Speeches")
+    st.subheader("Most Recent" if sort_key=="newest" else "Most Relevant")
     for (_, m, ch) in hits:
         st.markdown(f"**{m.get('date')} — [{m.get('title')}]({m.get('link')})**")
         sys = "You are an IMF speech analyst. Produce a concise snippet and 3–5 bullets grounded only in the excerpt."
@@ -187,22 +177,23 @@ with tab_res:
         for (d,t,l) in sources_from_hits(hits):
             st.markdown(f"- {d} — [{t}]({l})")
 
-# ---------------- Thematic Evolution (single date range) ----------------
-with tab_compare:
+# ---------------- Thematic Evolution (date range) ----------------
+with tab_comp:
     st.subheader("Thematic Evolution (LLM) — Date Range")
-    st.caption(f"Analyzing: **{date_from.isoformat()} → {date_to.isoformat()}**")
+    st.caption(f"Analyzing: **{filters['date_from'].isoformat()} → {filters['date_to'].isoformat()}**")
 
     def _within(hit, start_date, end_date):
+        import datetime as dt
         try:
-            d = _dt.date.fromisoformat(str(hit[1].get("date")))
+            d = dt.date.fromisoformat(str(hit[1].get("date")))
             return start_date <= d <= end_date
         except Exception:
             return False
 
-    range_hits = [h for h in hits_for_llm if _within(h, date_from, date_to)]
+    range_hits = [h for h in hits_for_llm if _within(h, filters['date_from'], filters['date_to'])]
 
     if not range_hits:
-        st.warning("No matching content in this date range with current filters. Try broadening the range or removing theme filters.")
+        st.warning("No matching content in this date range. Try broadening the range.")
     else:
         by_year = {}
         for (idx, m, ch) in range_hits:
@@ -225,14 +216,14 @@ with tab_compare:
         usr1 = f"""
 Topic: {query}
 
-Date range: {date_from.isoformat()} → {date_to.isoformat()}
+Date range: {filters['date_from'].isoformat()} → {filters['date_to'].isoformat()}
 
 Context grouped by year (each item starts with [YYYY-MM-DD — Title](link)):
 {full_ctx}
 
 Task: For each year in the range, list 3–5 ISSUE headings with 1–2 sentence summaries (no quotes). Keep it concise.
 """
-        (per_year_md, used_model1) = llm_cached(f"peryear::{query}::{date_from}::{date_to}::{model_preferred}", sys1, usr1, model=model_preferred, max_tokens=per_item_tokens, temperature=0.2)
+        (per_year_md, used_model1) = llm_cached(f"peryear::{query}::{filters['date_from']}::{filters['date_to']}::{model_preferred}", sys1, usr1, model=model_preferred, max_tokens=per_item_tokens, temperature=0.2)
         st.markdown("### Per-Year Focus")
         st.markdown(per_year_md)
         st.caption(f"Model: {used_model1}")
@@ -242,13 +233,13 @@ Task: For each year in the range, list 3–5 ISSUE headings with 1–2 sentence 
                 "Cite with (Month YYYY — Title) based on headers.")
         usr2 = f"""
 Topic: {query}
-Range: {date_from.isoformat()} → {date_to.isoformat()}
+Range: {filters['date_from'].isoformat()} → {filters['date_to'].isoformat()}
 
 Use the same context as above.
 
 Task: Write a short 'Messaging Evolution' narrative for the whole range (6–10 sentences, crisp).
 """
-        (evol_md, used_model2) = llm_cached(f"evol::{query}::{date_from}::{date_to}::{model_preferred}", sys2, usr2, model=model_preferred, max_tokens=per_item_tokens, temperature=0.2)
+        (evol_md, used_model2) = llm_cached(f"evol::{query}::{filters['date_from']}::{filters['date_to']}::{model_preferred}", sys2, usr2, model=model_preferred, max_tokens=per_item_tokens, temperature=0.2)
         st.markdown("### Messaging Evolution")
         st.markdown(evol_md)
         st.caption(f"Model: {used_model2}")
@@ -258,7 +249,7 @@ Task: Write a short 'Messaging Evolution' narrative for the whole range (6–10 
                 st.markdown(f"- {d} — [{t}]({l})")
 
 # ---------------- Top Quotes tab ----------------
-with tab_quotes:
+with tab_quote:
     st.subheader("Top Quotes (LLM)")
     ctx_quotes = format_hits_for_context(hits_for_llm, limit=(ctx_limit+2))
     sys_q = ("You extract on-topic quotes. Use ONLY provided context; return exact sentences. "
@@ -273,7 +264,7 @@ Context:
 Task:
 Return exactly 5 strong on-topic quotes (1–3 sentences each). Each bullet ends with (Month YYYY — Title).
 """
-    (quotes_md, used_model3) = llm_cached(f"quotes::{query}::{date_from}::{date_to}::{model_preferred}", sys_q, usr_q, model=model_preferred, max_tokens=per_item_tokens, temperature=0.2)
+    (quotes_md, used_model3) = llm_cached(f"quotes::{query}::{filters['date_from']}::{filters['date_to']}::{model_preferred}", sys_q, usr_q, model=model_preferred, max_tokens=per_item_tokens, temperature=0.2)
     st.markdown(quotes_md)
     st.caption(f"Model: {used_model3}")
     with st.expander("Show sources (Quotes)"):
@@ -298,7 +289,7 @@ Tasks:
 - Short timeline bullets (Month YYYY — Title).
 Return clean Markdown.
 """
-    (brief_md, used_model4) = llm_cached(f"brief::{query}::{date_from}::{date_to}::{model_preferred}", sys_b, usr_b, model=model_preferred, max_tokens=per_item_tokens+200, temperature=0.25)
+    (brief_md, used_model4) = llm_cached(f"brief::{query}::{filters['date_from']}::{filters['date_to']}::{model_preferred}", sys_b, usr_b, model=model_preferred, max_tokens=per_item_tokens+200, temperature=0.25)
     st.markdown(brief_md)
     st.caption(f"Model: {used_model4}")
     st.download_button("Download briefing (Markdown)", brief_md.encode("utf-8"), file_name="briefing.md", mime="text/markdown")
@@ -306,8 +297,6 @@ Return clean Markdown.
 # ---------------- Analytics tab (visuals) ----------------
 with tab_viz:
     st.subheader("Analytics & Visuals")
-
-    # Build a tiny frame of returned results for charts
     viz_rows = []
     for (_, m, _ch) in hits:
         viz_rows.append({
@@ -315,40 +304,43 @@ with tab_viz:
             "year": int(str(m.get("date"))[:4]) if m.get("date") else None,
             "title": m.get("title"),
             "link": m.get("link"),
-            "themes": ", ".join(m.get("themes") or [])
         })
     vdf = pd.DataFrame(viz_rows)
     if not vdf.empty:
         vdf["date"] = pd.to_datetime(vdf["date"], errors="coerce")
-
         c1, c2 = st.columns(2)
         with c1:
             st.caption("Timeline of matching speeches")
             tl = vdf.sort_values("date")
-            fig = px.scatter(tl, x="date", y=[1]*len(tl), hover_data=["title","themes"], labels={"y":""})
+            fig = px.scatter(tl, x="date", y=[1]*len(tl), hover_data=["title"], labels={"y":""})
             fig.update_yaxes(visible=False, showticklabels=False)
             st.plotly_chart(fig, use_container_width=True)
-
         with c2:
             st.caption("Speeches by year (current result set)")
             year_ct = vdf.groupby("year")["title"].count().reset_index(name="speeches")
             fig2 = px.bar(year_ct.sort_values("year"), x="year", y="speeches")
             st.plotly_chart(fig2, use_container_width=True)
-
-        if theme_col:
-            st.caption("Top themes in current results")
-            explode = []
-            for (_, m, _ch) in hits:
-                for t in (m.get("themes") or []):
-                    explode.append({"theme": t})
-            tdf = pd.DataFrame(explode)
-            if not tdf.empty:
-                top_t = tdf["theme"].value_counts().reset_index()
-                top_t.columns = ["theme","count"]
-                fig3 = px.bar(top_t.head(15), x="theme", y="count")
-                st.plotly_chart(fig3, use_container_width=True)
     else:
         st.info("No data to chart yet — adjust your query or date range.")
+
+# ---------------- (Optional) Trajectory tab ----------------
+if _HAS_P3:
+    with tab_traj:
+        st.subheader("Messaging Trajectory")
+        ctx = format_hits_for_context(hits_for_llm, limit=(ctx_limit+4))
+        series = build_issue_trajectory(query, ctx, model_preferred)  # returns DataFrame columns: year, issue, share
+        if not series.empty:
+            fig = px.area(series, x="year", y="share", color="issue", groupnorm="fraction")
+            st.plotly_chart(fig, use_container_width=True)
+            forecast = forecast_issue_trends(series)
+            if not forecast.empty:
+                st.markdown("**Next-year trend (simple forecast)**")
+                fig2 = px.bar(forecast, x="issue", y="forecast_share")
+                st.plotly_chart(fig2, use_container_width=True)
+            nar = trajectory_narrative(query, ctx, model_preferred)
+            st.markdown(nar)
+        else:
+            st.info("No trajectory could be derived from current context.")
 
 # ---------------- Alignment tab ----------------
 with tab_align:
@@ -356,92 +348,40 @@ with tab_align:
     playbook = load_playbook()
     ctx = format_hits_for_context(hits_for_llm, limit=(ctx_limit+2))
 
-    # Radar/bar + narrative
-    radar_df = alignment_radar_data(query, playbook, ctx, model_preferred)
-    if radar_df is not None and not radar_df.empty and set(["issue","score"]).issubset(radar_df.columns):
+    # Optional numeric gauge if Phase 3 present
+    if _HAS_P3:
         try:
-            if len(radar_df) >= 3:
-                fig = px.line_polar(radar_df, r="score", theta="issue", line_close=True)
-                fig.update_traces(fill='toself')
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                fig = px.bar(radar_df, x="issue", y="score")
-                st.plotly_chart(fig, use_container_width=True)
+            score = numeric_alignment_score(query, playbook, ctx, model_preferred)  # 0..100
+            st.metric("Alignment Score", f"{int(score)} / 100")
         except Exception:
-            st.dataframe(radar_df)
+            pass
+
+    radar_df = alignment_radar_data(query, playbook, ctx, model_preferred)
+    if radar_df is not None and not radar_df.empty and len(radar_df) >= 3:
+        fig = px.line_polar(radar_df, r="score", theta="issue", line_close=True)
+        fig.update_traces(fill='toself')
+        st.plotly_chart(fig, use_container_width=True)
+    elif radar_df is not None and not radar_df.empty:
+        st.caption("Not enough distinct issues for a radar. Showing bars instead.")
+        figb = px.bar(radar_df.sort_values("score", ascending=False), x="issue", y="score")
+        st.plotly_chart(figb, use_container_width=True)
     else:
-        st.info("No issues detected for radar. Try widening the date range or query.")
+        st.info("No issues detected. Try broadening the range or query.")
 
     nar = alignment_narrative(query, playbook, ctx, model_preferred)
     st.markdown(nar)
 
-# ---------------- Rapid Response tab ----------------
+# ---------------- Rapid Response tab (unchanged UI assumed) ----------------
 with tab_rr:
     st.subheader("Rapid Response")
-
-    # A) Generate from live news URL
-    st.markdown("#### From a News URL")
-    url_in = st.text_input("Paste a news article URL")
-    if st.button("Generate press lines from URL"):
-        if not url_in.strip():
-            st.warning("Please paste a URL first.")
-        else:
-            art = extract_from_url(url_in.strip())
-            if not art or not art.get("text"):
-                st.error("Could not extract content from this URL. Try another link or paste the text manually.")
-            else:
-                st.success(f"Pulled: {art.get('title','(untitled)')} — {art.get('date','unknown date')}")
-                ctx = format_hits_for_context(hits_for_llm, limit=(ctx_limit+4))
-                sys = ("You write rapid-response lines grounded ONLY in the provided IMF speech context AND the article content. "
-                       "No speculation; if unknown, say 'we are assessing'. Tone: calm, factual, forward-looking.")
-                usr = f"""Article title: {art.get('title')}
-Article date: {art.get('date')}
-Article source text (trimmed):
-{art.get('text')[:4000]}
-
-IMF speech context:
-{ctx}
-
-Tasks:
-- 4–6 press lines (bulleted), 1 sentence each.
-- 3 policy specifics with (Month YYYY — Title) from IMF context.
-- 3 reporter Q&As (Q + short A grounded in context; if not addressed previously, say so and bridge to what we have said).
-
-Return clean Markdown.
-"""
-                (pack_md, used_model) = llm_cached(f"rr_url::{url_in}::{query}", sys, usr, model=model_preferred, max_tokens=900, temperature=0.2)
-                st.markdown(pack_md)
-                st.caption(f"Model: {used_model}")
-                st.download_button("Download press lines (Markdown)", pack_md.encode("utf-8"), file_name="press_lines.md", mime="text/markdown")
-
-    st.divider()
-
-    # B) Generate from reporter question
-    st.markdown("#### From a Reporter Question")
-    rq = st.text_area("Paste the reporter's question")
-    if st.button("Generate press lines from question"):
-        if not rq.strip():
-            st.warning("Please paste the reporter question first.")
-        else:
-            ctx = format_hits_for_context(hits_for_llm, limit=(ctx_limit+6))
-            sys = ("You craft a comprehensive press packet in the speaker's voice grounded ONLY in past remarks. "
-                   "If we haven't addressed the issue directly, say so and propose a bridging line consistent with our established positions.")
-            usr = f"""Reporter question:
-{rq}
-
-Grounding excerpts:
-{ctx}
-
-Tasks:
-- 4–6 press lines (1 sentence each), grounded in context. If not directly addressed historically, say so and provide a careful bridge.
-- 3–4 key facts/policy specifics with (Month YYYY — Title).
-- 3 Q&As (Q + short A, with references).
-Return clean Markdown.
-"""
-            (pack_md, used_model) = llm_cached(f"rr_q::{hashlib.sha256(rq.encode()).hexdigest()}::{query}", sys, usr, model=model_preferred, max_tokens=950, temperature=0.25)
-            st.markdown(pack_md)
-            st.caption(f"Model: {used_model}")
-            st.download_button("Download press packet (Markdown)", pack_md.encode("utf-8"), file_name="press_packet.md", mime="text/markdown")
+    colh1, colh2 = st.columns(2)
+    headline = colh1.text_input("Paste headline or topic", "")
+    url_hint = colh2.text_input("Optional: related URL (for context note only)", "")
+    if st.button("Generate Press Lines"):
+        ctx = format_hits_for_context(hits_for_llm, limit=(ctx_limit+4))
+        pack_md = rapid_response_pack(headline or query, ctx, model_preferred, url_hint=url_hint)
+        st.markdown(pack_md)
+        st.download_button("Download rapid-response (Markdown)", pack_md.encode("utf-8"), file_name="rapid_response.md", mime="text/markdown")
 
 # ---------------- Tone tab ----------------
 with tab_tone:
@@ -506,73 +446,3 @@ with tab_stake:
         st.markdown(nar)
     else:
         st.info("No clear stakeholder mapping detected—try a broader query or range.")
-
-# ---------------- Ingest tab ----------------
-with tab_ingest:
-    st.subheader("Add New Content to Corpus & Rebuild Index")
-
-    st.markdown("**Option A — Add by URL**")
-    colu1, colu2 = st.columns([3,1])
-    new_url = colu1.text_input("Speech/interview URL", placeholder="https://...")
-    fetch_btn = colu2.button("Fetch & Preview")
-    if fetch_btn and new_url.strip():
-        art = extract_from_url(new_url.strip())
-        if not art or not art.get("text"):
-            st.error("Could not extract from this URL. If it's behind a paywall or script-heavy, paste the text instead.")
-        else:
-            st.success("Fetched content. Review and edit as needed before saving.")
-            with st.form("save_from_url"):
-                title = st.text_input("Title", art.get("title","(untitled)"))
-                date  = st.date_input("Date", value=_dt.date.fromisoformat(art.get("date")) if art.get("date") else _dt.date.today())
-                link  = st.text_input("Link", new_url.strip())
-                location = st.text_input("Location (optional)", "")
-                raw = st.text_area("Text (you can edit)", art.get("text",""), height=200)
-                themes = st.text_input("Themes (comma-separated, optional)", "")
-                submitted = st.form_submit_button("Add to corpus")
-                if submitted:
-                    rec = normalize_record(title=title, date=str(date), link=link, location=location, transcript=raw, themes=themes)
-                    ok, msg = add_records_and_rebuild([rec])
-                    if ok:
-                        st.success(msg + " — Re-run your search to see new content.")
-                    else:
-                        st.error(msg)
-
-    st.divider()
-    st.markdown("**Option B — Upload a File**")
-    up = st.file_uploader("PDF, DOCX, TXT, MP3, M4A, WAV, MP4, WEBM", type=["pdf","docx","txt","mp3","m4a","wav","mp4","webm"])
-    if up is not None:
-        ext = (up.name.split(".")[-1] or "").lower()
-        text = ""
-        try:
-            if ext == "pdf":
-                text = extract_from_pdf(up.read())
-            elif ext == "docx":
-                text = extract_from_docx(up.read())
-            elif ext == "txt":
-                text = extract_from_txt(up.read())
-            elif ext in ("mp3","m4a","wav","mp4","webm"):
-                text = transcribe_media(up.read(), up.name)
-            else:
-                st.error("Unsupported file type.")
-        except Exception as e:
-            st.exception(e)
-
-        if text:
-            st.success(f"Extracted ~{len(text.split())} words.")
-            with st.form("save_from_upload"):
-                title = st.text_input("Title", up.name.rsplit(".",1)[0])
-                date  = st.date_input("Date", value=_dt.date.today())
-                link  = st.text_input("Link (optional)", "")
-                location = st.text_input("Location (optional)", "")
-                raw = st.text_area("Text (you can edit)", text, height=200)
-                themes = st.text_input("Themes (comma-separated, optional)", "")
-                submitted2 = st.form_submit_button("Add to corpus")
-                if submitted2:
-                    rec = normalize_record(title=title, date=str(date), link=link, location=location, transcript=raw, themes=themes)
-                    ok, msg = add_records_and_rebuild([rec])
-                    if ok:
-                        st.success(msg + " — Re-run your search to see new content.")
-                    else:
-                        st.error(msg)
-
-    st.info("Note: Rebuilding the index embeds and reindexes all content (fast, but may take ~30–60s). Ensure OPENAI_API_KEY is set.")
