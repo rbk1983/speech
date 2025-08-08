@@ -6,3 +6,7 @@ tiktoken
 plotly
 pyyaml
 feedparser
+readability-lxml
+beautifulsoup4
+pdfplumber
+python-docx
