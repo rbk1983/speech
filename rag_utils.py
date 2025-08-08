@@ -1,61 +1,95 @@
-# rag_utils.py — retrieval and LLM helpers
-
-import os
-import json
-import pickle
+# rag_utils.py — retrieval and LLM helpers (robust)
+import os, json, datetime as _dt
+import numpy as np
 import pandas as pd
 import faiss
 from openai import OpenAI
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# Single OpenAI client
+_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# --- Loaders
+# ---------- Loaders ----------
+
 def load_df():
     """Load speeches dataframe from pickle."""
     if os.path.exists("speeches_data_reclassified.pkl"):
-        return pd.read_pickle("speeches_data_reclassified.pkl")
+        df = pd.read_pickle("speeches_data_reclassified.pkl")
     elif os.path.exists("speeches_data.pkl"):
-        return pd.read_pickle("speeches_data.pkl")
+        df = pd.read_pickle("speeches_data.pkl")
     else:
-        raise FileNotFoundError("No speeches_data.pkl or speeches_data_reclassified.pkl found in repo.")
+        raise FileNotFoundError("No dataset found. Add speeches_data_reclassified.pkl or speeches_data.pkl to repo root.")
+    if "date" not in df.columns:
+        raise ValueError("Dataset must have a 'date' column.")
+    df["date"] = pd.to_datetime(df["date"])
+    return df
 
 def load_index():
-    """Load FAISS index, metadata, and chunks."""
+    """Load FAISS index, metadata, and chunks (supports dict or list file formats)."""
     if not os.path.exists("index.faiss"):
-        raise FileNotFoundError("index.faiss not found.")
+        raise FileNotFoundError("index.faiss not found. Build the index first (use the in-app button).")
     index = faiss.read_index("index.faiss")
+
     with open("meta.json", "r", encoding="utf-8") as f:
-        metas = json.load(f)
+        meta_raw = json.load(f)
+    metas = meta_raw.get("metas", meta_raw)  # support {"metas":[...]} or [...]
+
     with open("chunks.json", "r", encoding="utf-8") as f:
-        chunks = json.load(f)
+        chunks_raw = json.load(f)
+    chunks = chunks_raw.get("chunks", chunks_raw)  # support {"chunks":[...]} or [...]
+
+    if not isinstance(metas, list) or not isinstance(chunks, list):
+        raise ValueError("meta.json / chunks.json malformed. Expected lists.")
+    if len(metas) != len(chunks):
+        # Not fatal, but warn in logs
+        pass
     return index, metas, chunks
 
-# --- Retriever
+# ---------- Filters helper ----------
+
+def _passes(meta, filters):
+    if not filters:
+        return True
+    # themes filter (list of strings)
+    if "themes" in filters and filters["themes"]:
+        speech_themes = meta.get("themes") or []
+        if not any(t in speech_themes for t in filters["themes"]):
+            return False
+    # years filter (optional)
+    if "years" in filters and filters["years"]:
+        if meta.get("year") not in filters["years"]:
+            return False
+    # location filter (optional)
+    if "location" in filters and filters["location"]:
+        if filters["location"].lower() not in (meta.get("location","").lower()):
+            return False
+    return True
+
+# ---------- Retriever (dedupe + newest first) ----------
+
 def retrieve(query, index, metas, chunks, k=16, filters=None):
-    """Search FAISS, dedupe to one chunk per speech, then sort by date (newest first)."""
-    from openai import OpenAI
-    import numpy as np
-    import datetime as _dt
-
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-    # >>> Use the SAME embedding model as used to build the index <<<
-    qv = client.embeddings.create(
-        model="text-embedding-3-large",   # <-- match build_index.py
+    """
+    Search FAISS with query, dedupe to one best chunk per speech, sort by date desc.
+    NOTE: Must use the same embedding model as build_index.py.
+    """
+    # Embed with SAME model used to build the index
+    qv = _client.embeddings.create(
+        model="text-embedding-3-large",  # match build_index.py
         input=query
     ).data[0].embedding
 
-    D, I = index.search(np.array([qv], dtype="float32"), k * 4)  # over-fetch, then filter/dedupe
+    # Over-fetch, then filter/dedupe
+    D, I = index.search(np.array([qv], dtype="float32"), k * 4)
     candidates = []
+    n = len(metas)
     for idx, score in zip(I[0], D[0]):
-        if idx == -1:
+        if idx < 0 or idx >= n:
             continue
         m = metas[idx]
-        if filters and not _passes(m, filters):
+        if not _passes(m, filters):
             continue
         candidates.append((idx, m, chunks[idx], float(score)))
 
-    # Dedupe to one hit per speech (title+date+link) keeping the highest-scoring one
+    # Dedupe by (title, date, link) keeping highest score
     best = {}
     for idx, m, ch, score in candidates:
         key = (m.get("title"), m.get("date"), m.get("link"))
@@ -64,7 +98,7 @@ def retrieve(query, index, metas, chunks, k=16, filters=None):
 
     deduped = list(best.values())
 
-    # Sort by date desc (expects 'YYYY-MM-DD' or ISO-like). If anything weird, fall back safely.
+    # Sort newest first by meta["date"] (ISO string like YYYY-MM-DD)
     def _date_key(meta_date):
         try:
             return _dt.datetime.fromisoformat(str(meta_date))
@@ -73,19 +107,18 @@ def retrieve(query, index, metas, chunks, k=16, filters=None):
 
     deduped.sort(key=lambda t: _date_key(t[1].get("date", "")), reverse=True)
 
-    # Return the top-k without the score
     return [(idx, m, ch) for (idx, m, ch, _score) in deduped[:k]]
 
+# ---------- LLM wrapper ----------
 
-# --- LLM wrapper
-def llm(system_prompt, user_prompt, model="gpt-4o-mini", max_tokens=800):
-    """Query OpenAI ChatCompletion."""
-    resp = client.chat.completions.create(
+def llm(system_prompt, user_prompt, model="gpt-4o-mini", max_tokens=900, temperature=0.3):
+    resp = _client.chat.completions.create(
         model=model,
         messages=[
             {"role": "system", "content": system_prompt.strip()},
-            {"role": "user", "content": user_prompt.strip()}
+            {"role": "user", "content": user_prompt.strip()},
         ],
+        temperature=temperature,
         max_tokens=max_tokens,
     )
-    return resp.choices[0].message.content
+    return resp.choices[0].message.content.strip()
