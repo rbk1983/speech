@@ -133,14 +133,37 @@ def format_hits_for_context(hits, limit=12, char_limit=900):
         out.append(head + "\n" + excerpt)
     return "\n\n".join(out) if out else "(no matching context)"
 
+# rag_utils.py -> replace llm() with this robust version
+from openai import BadRequestError
+
 def llm(system_prompt, user_prompt, model="gpt-5-mini", max_tokens=900, temperature=0.3):
-    resp = _client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system_prompt.strip()},
-            {"role": "user", "content": user_prompt.strip()},
-        ],
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
-    return resp.choices[0].message.content.strip()
+    """
+    Robust LLM wrapper:
+    - Tries requested model (default gpt-5-mini)
+    - On BadRequest (e.g., model not found / not permitted / token issues), falls back to gpt-4o-mini
+    Returns (text, model_used) so the UI can display the actual model.
+    """
+    def _call(m):
+        resp = _client.chat.completions.create(
+            model=m,
+            messages=[
+                {"role": "system", "content": system_prompt.strip()},
+                {"role": "user", "content": user_prompt.strip()},
+            ],
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return resp.choices[0].message.content.strip()
+
+    try:
+        text = _call(model)
+        return text, model
+    except BadRequestError:
+        # Fallback to a widely-available model
+        fb = "gpt-4o-mini"
+        try:
+            text = _call(fb)
+            return text, fb
+        except Exception as e:
+            # Re-raise the original model error details if fallback fails too
+            raise e
