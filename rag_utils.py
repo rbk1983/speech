@@ -1,11 +1,10 @@
-# rag_utils.py — robust RAG helpers + sorting, filters, pagination
+# rag_utils.py — robust RAG helpers with stable models and safe LLM fallback
 import os, json, datetime as _dt
 import numpy as np
 import pandas as pd
 import faiss
 from openai import OpenAI
 
-# One client
 _client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # ---------- Loaders ----------
@@ -19,7 +18,6 @@ def load_df():
     if "date" not in df.columns or "transcript" not in df.columns:
         raise ValueError("Dataset needs 'date' and 'transcript' columns.")
     df["date"] = pd.to_datetime(df["date"])
-    # normalize helpers
     if "title" not in df.columns: df["title"] = "(untitled)"
     if "link" not in df.columns: df["link"] = ""
     if "themes" not in df.columns and "new_themes" not in df.columns:
@@ -43,12 +41,10 @@ def load_index():
 # ---------- Filters ----------
 def _passes(meta, filters):
     if not filters: return True
-    # theme facet
     if filters.get("themes"):
         speech_themes = meta.get("themes") or []
         if not any(t in speech_themes for t in filters["themes"]):
             return False
-    # date range facet
     if filters.get("date_from") or filters.get("date_to"):
         try:
             d = _dt.date.fromisoformat(str(meta.get("date")))
@@ -76,8 +72,6 @@ def retrieve(query, index, metas, chunks, k=50, filters=None, sort="relevance", 
         input=query
     ).data[0].embedding
 
-    # over-fetch then filter/dedupe
-    import numpy as np
     D, I = index.search(np.array([qv], dtype="float32"), max(k * 8, 50))
     n = len(metas)
     cands = []
@@ -87,7 +81,7 @@ def retrieve(query, index, metas, chunks, k=50, filters=None, sort="relevance", 
         if not _passes(m, filters): continue
         cands.append((idx, m, chunks[idx], float(score)))
 
-    # dedupe to one best chunk per speech (title, date, link)
+    # dedupe to one best chunk per speech
     best = {}
     for idx, m, ch, score in cands:
         key = (m.get("title"), m.get("date"), m.get("link"))
@@ -95,13 +89,11 @@ def retrieve(query, index, metas, chunks, k=50, filters=None, sort="relevance", 
             best[key] = (idx, m, ch, score)
     items = list(best.values())
 
-    # sort
     if sort == "newest":
         items.sort(key=lambda t: _date_key(t[1].get("date","")), reverse=True)
-    else:  # relevance
+    else:
         items.sort(key=lambda t: t[3], reverse=True)
 
-    # paginate
     page = items[offset: offset + limit]
     results = [(i, m, ch) for (i, m, ch, _s) in page]
     total = len(items)
@@ -109,14 +101,12 @@ def retrieve(query, index, metas, chunks, k=50, filters=None, sort="relevance", 
 
 # ---------- Helpers ----------
 def sources_from_hits(hits):
-    """Return a deduped list of (date, title, link) from hits."""
     seen, out = set(), []
     for _, m, _ in hits:
         key = (m.get("date"), m.get("title"), m.get("link"))
         if key in seen: continue
         seen.add(key)
         out.append(key)
-    # newest first
     out.sort(key=lambda t: _date_key(t[0]), reverse=True)
     return out
 
@@ -129,19 +119,15 @@ def format_hits_for_context(hits, limit=12, char_limit=900):
         seen.add(key)
         if len(out) >= limit: break
         head = f"[{m.get('date')} — {m.get('title')}]({m.get('link')})"
-        excerpt = textwrap.shorten((ch or '').replace("\n"," "), width=char_limit, placeholder="…")
-        out.append(head + "\n" + excerpt)
-    return "\n\n".join(out) if out else "(no matching context)"
+        excerpt = textwrap.shorten((ch or '').replace("\\n"," "), width=char_limit, placeholder="…")
+        out.append(head + "\\n" + excerpt)
+    return "\\n\\n".join(out) if out else "(no matching context)"
 
-# rag_utils.py -> replace llm() with this robust version
-from openai import BadRequestError
-
-def llm(system_prompt, user_prompt, model="gpt-5-mini", max_tokens=900, temperature=0.3):
+# ---------- LLM wrapper (robust, fallback) ----------
+def llm(system_prompt, user_prompt, model="gpt-4o-mini", max_tokens=700, temperature=0.3):
     """
-    Robust LLM wrapper:
-    - Tries requested model (default gpt-5-mini)
-    - On BadRequest (e.g., model not found / not permitted / token issues), falls back to gpt-4o-mini
-    Returns (text, model_used) so the UI can display the actual model.
+    Try requested model; on failure, fallback to gpt-4o-mini then gpt-4o.
+    Returns TEXT, not a tuple. app_llm.py wraps it and adds model badge.
     """
     def _call(m):
         resp = _client.chat.completions.create(
@@ -155,15 +141,15 @@ def llm(system_prompt, user_prompt, model="gpt-5-mini", max_tokens=900, temperat
         )
         return resp.choices[0].message.content.strip()
 
+    # Preferred
     try:
-        text = _call(model)
-        return text, model
-    except BadRequestError:
-        # Fallback to a widely-available model
-        fb = "gpt-4o-mini"
-        try:
-            text = _call(fb)
-            return text, fb
-        except Exception as e:
-            # Re-raise the original model error details if fallback fails too
-            raise e
+        return _call(model)
+    except Exception:
+        # Fallbacks
+        for fb in ("gpt-4o-mini", "gpt-4o"):
+            try:
+                return _call(fb)
+            except Exception:
+                continue
+        # Final raise if nothing worked
+        raise

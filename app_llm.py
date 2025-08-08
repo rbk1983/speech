@@ -1,5 +1,5 @@
-# app_llm.py — Streamlit app with date-range Thematic Evolution, faster GPT-4.1-mini default,
-# caching, fallbacks, polished UI, and interactive visuals.
+# app_llm.py — Streamlit app with date-range Thematic Evolution, caching,
+# robust model fallback (gpt-4o-mini / gpt-4o), polished UI, and interactive visuals.
 import os, datetime as _dt, hashlib
 import pandas as pd
 import streamlit as st
@@ -67,7 +67,7 @@ with st.sidebar:
     view_mode = st.radio(
         "LLM Mode",
         ["Speed", "Depth"],
-        help="Speed: GPT-4.1-mini (fallbacks if unavailable) with smaller context. Depth: GPT-4.1 with more context.",
+        help="Speed: gpt-4o-mini (smaller context). Depth: gpt-4o (more context).",
         horizontal=True
     )
 
@@ -105,41 +105,35 @@ theme_filter = st.multiselect("Filter by theme (optional)", all_themes, help="Cl
 filters = {"themes": theme_filter, "date_from": date_from, "date_to": date_to}
 
 # ---------------- Model choice / context limits ----------------
-# Default to GPT-4.1 family for speed/availability, with smaller contexts in Speed mode.
+# Use widely-available models to avoid BadRequest: gpt-4o-mini (Speed) and gpt-4o (Depth).
 if view_mode == "Depth":
-    model_preferred = "gpt-4.1"      # higher quality
+    model_preferred = "gpt-4o"      # higher quality, broadly available
     ctx_limit = 12                   # how many items to include in LLM context sections
-    per_item_tokens = 1000
+    per_item_tokens = 950
 else:
-    model_preferred = "gpt-4.1-mini" # faster & cheaper
+    model_preferred = "gpt-4o-mini" # faster & cheaper, broadly available
     ctx_limit = 8
-    per_item_tokens = 700
+    per_item_tokens = 650
 
-# ---------------- Cached LLM wrapper with fallback & model badge ----------------
+# ---------------- Cached LLM wrapper with model badge ----------------
 @st.cache_data(show_spinner=False)
 def llm_cached(cache_key: str, system: str, user: str, model: str, max_tokens: int, temperature: float):
-    """Call llm() with robust fallback and return (text, model_used). Works even if rag_utils.llm returns just text."""
+    """Call llm() and return (text, model_used). Works even if rag_utils.llm returns just text."""
     _ = hashlib.sha256((cache_key + system + user + model + str(max_tokens) + str(temperature)).encode("utf-8")).hexdigest()
-    # 1) Try preferred model
     try:
         resp = llm(system, user, model=model, max_tokens=max_tokens, temperature=temperature)
         if isinstance(resp, tuple) and len(resp) == 2:
-            return resp  # (text, model_used) from rag_utils
+            return resp  # (text, model_used)
         else:
-            return (resp, model)  # assume resp is text
+            return (resp, model)
     except Exception:
-        # 2) Fallbacks in order
-        for fb in ["gpt-4o-mini", "gpt-4o"]:
-            try:
-                resp = llm(system, user, model=fb, max_tokens=max_tokens, temperature=temperature)
-                if isinstance(resp, tuple) and len(resp) == 2:
-                    return resp
-                else:
-                    return (resp, fb)
-            except Exception:
-                continue
-        # If all fail, raise
-        raise
+        # Try one fallback then re-raise
+        fb = "gpt-4o-mini" if model != "gpt-4o-mini" else "gpt-4o"
+        resp = llm(system, user, model=fb, max_tokens=max_tokens, temperature=temperature)
+        if isinstance(resp, tuple) and len(resp) == 2:
+            return resp
+        else:
+            return (resp, fb)
 
 # ---------------- Retrieval ----------------
 if not query or not query.strip():
@@ -154,7 +148,7 @@ hits, total = retrieve(query, index, metas, chunks, k=100, filters=filters, sort
 st.caption(f"Showing {len(hits)} of {total} results — page {offset//limit + 1}")
 
 # Cap how many items feed the LLM sections (for speed)
-hits_for_llm = hits[: (30 if view_mode == "Depth" else 18)]
+hits_for_llm = hits[: (28 if view_mode == "Depth" else 16)]
 
 # Pagination buttons
 c1, c2, _ = st.columns([1,1,6])
