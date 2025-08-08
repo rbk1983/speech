@@ -2,8 +2,17 @@
 import os, datetime as _dt
 import streamlit as st
 import plotly.express as px
-import pandas as pd     # ← add this line
+import pandas as pd
+import hashlib  # ← add this
 from rag_utils import load_df, load_index, retrieve, sources_from_hits, format_hits_for_context, llm
+
+@st.cache_data(show_spinner=False)
+def llm_cached(key: str, system: str, user: str, model: str, max_tokens: int, temperature: float):
+    # Simple cache key: hash the inputs
+    cache_key = hashlib.sha256((key + system + user + model + str(max_tokens) + str(temperature)).encode("utf-8")).hexdigest()
+    # Streamlit caches on function args; we also return the text so repeats are instant
+    text = llm(system, user, model=model, max_tokens=max_tokens, temperature=temperature)
+    return text
 
 
 st.set_page_config(page_title="Kristalina Speech Intelligence (LLM)", layout="wide")
@@ -117,23 +126,27 @@ tab_res, tab_compare, tab_quotes, tab_brief, tab_viz = st.tabs(
     ["Results", "Quick Compare", "Top Quotes", "Briefing Pack", "Analytics"]
 )
 
-# Model choice / context size
-model = "gpt-4o" if view_mode == "Depth" else "gpt-4o-mini"
-ctx_limit = 18 if view_mode == "Depth" else 10
+# Model choice / context size (tighter limits for speed)
+if view_mode == "Depth":
+    model = "gpt-5"        # higher quality, slower
+    ctx_limit = 12         # fewer chunks than before to keep latency reasonable
+    per_item_tokens = 1000 # generous but not huge
+else:
+    model = "gpt-5-mini"   # fast & cheap
+    ctx_limit = 8          # trim context to speed up
+    per_item_tokens = 700
+
 
 # ---------- Results tab ----------
-with tab_res:
-    st.subheader("Most Relevant Speeches" if sort_key=="relevance" else "Most Recent Speeches")
-    for (_, m, ch) in hits:
-        st.markdown(f"**{m.get('date')} — [{m.get('title')}]({m.get('link')})**")
-        # LLM snippet + bullets
-        sys = "You are an IMF speech analyst. Produce a concise snippet and 3–5 bullets grounded only in the excerpt."
-        usr = f"Excerpt:\n{ch}\n\nReturn a 1–2 sentence snippet, then 3–5 bullets of key points."
-        md = llm(sys, usr, model=model, max_tokens=450, temperature=0.3)
-        st.markdown(md)
-    with st.expander("Show sources used on this page"):
-        for (d,t,l) in sources_from_hits(hits):
-            st.markdown(f"- {d} — [{t}]({l})")
+for (_, m, ch) in hits:
+    st.markdown(f"**{m.get('date')} — [{m.get('title')}]({m.get('link')})**")
+    sys = "You are an IMF speech analyst. Produce a concise snippet and 3–5 bullets grounded only in the excerpt."
+    usr = f"Excerpt:\n{ch}\n\nReturn a 1–2 sentence snippet, then 3–5 bullets of key points."
+    # cache key based on content + model
+    key = f"res::{m.get('date')}::{m.get('title')}::{model}"
+    md = llm_cached(key, sys, usr, model=model, max_tokens=per_item_tokens, temperature=0.2)
+    st.markdown(md)
+
 
 # ---------- Thematic Evolution tab (single date range) ----------
 with tab_compare:
@@ -166,7 +179,7 @@ with tab_compare:
 
         # Build a structured context: "Year YYYY" section with several excerpts
         # Use a modest limit per year so we don't overload the model
-        per_year_limit = max(4, min(10, 2 * (18 if view_mode == "Depth" else 10) // max(1, len(years_asc))))
+        per_year_limit = max(3, min(6, ctx_limit // max(1, len(years_asc))))
         year_sections = []
         for y in years_asc:
             ctx = format_hits_for_context(by_year[y], limit=per_year_limit, char_limit=900)
