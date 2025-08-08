@@ -31,35 +31,51 @@ def load_index():
     return index, metas, chunks
 
 # --- Retriever
-def retrieve(query, index, metas, chunks, k=10, filters=None):
-    """Search FAISS index and return top matches."""
+def retrieve(query, index, metas, chunks, k=16, filters=None):
+    """Search FAISS, dedupe to one chunk per speech, then sort by date (newest first)."""
     from openai import OpenAI
     import numpy as np
+    import datetime as _dt
 
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
     # Embed query
-    q_emb = client.embeddings.create(
+    qv = client.embeddings.create(
         model="text-embedding-3-small",
         input=query
     ).data[0].embedding
 
-    D, I = index.search(np.array([q_emb], dtype="float32"), k)
-    results = []
-    for idx in I[0]:
+    D, I = index.search(np.array([qv], dtype="float32"), k * 4)  # over-fetch, then filter/dedupe
+    candidates = []
+    for idx, score in zip(I[0], D[0]):
         if idx == -1:
             continue
         m = metas[idx]
-        if filters:
-            skip = False
-            for fkey, fvals in filters.items():
-                if not set(m.get(fkey, [])) & set(fvals):
-                    skip = True
-                    break
-            if skip:
-                continue
-        results.append((idx, m, chunks[idx]))
-    return results
+        if filters and not _passes(m, filters):
+            continue
+        candidates.append((idx, m, chunks[idx], float(score)))
+
+    # Dedupe to one hit per speech (title+date+link) keeping the highest-scoring one
+    best = {}
+    for idx, m, ch, score in candidates:
+        key = (m.get("title"), m.get("date"), m.get("link"))
+        if key not in best or score > best[key][3]:
+            best[key] = (idx, m, ch, score)
+
+    deduped = list(best.values())
+
+    # Sort by date desc (expects 'YYYY-MM-DD' or ISO-like). If anything weird, fall back safely.
+    def _date_key(meta_date):
+        try:
+            return _dt.datetime.fromisoformat(str(meta_date))
+        except Exception:
+            return _dt.datetime.min
+
+    deduped.sort(key=lambda t: _date_key(t[1].get("date", "")), reverse=True)
+
+    # Return the top-k without the score
+    return [(idx, m, ch) for (idx, m, ch, _score) in deduped[:k]]
+
 
 # --- LLM wrapper
 def llm(system_prompt, user_prompt, model="gpt-4o-mini", max_tokens=800):
