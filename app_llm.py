@@ -134,49 +134,100 @@ with tab_res:
             st.markdown(f"- {d} — [{t}]({l})")
 
 # ---------- Quick Compare tab ----------
+# ---------- Quick Compare tab ----------
 with tab_compare:
     st.subheader("Thematic Quick Compare (LLM)")
-    years_avail = sorted(df["date"].dt.year.unique())
-    colA, colB = st.columns(2)
-    year_a = colA.selectbox("Year A", years_avail, index=0)
-    year_b = colB.selectbox("Year B", years_avail, index=min(1, len(years_avail)-1))
 
-    # Make year-specific contexts from the CURRENT (filtered) result universe
-    year_a_hits = [h for h in hits if int(h[1].get("year",0)) == int(year_a)]
-    year_b_hits = [h for h in hits if int(h[1].get("year",0)) == int(year_b)]
+    compare_mode = st.radio("Compare mode", ["Years", "Date ranges"], horizontal=True)
 
     def _context(hlist, limit=ctx_limit):
         return format_hits_for_context(hlist, limit=limit, char_limit=900)
 
-    ctx_a = _context(year_a_hits)
-    ctx_b = _context(year_b_hits)
+    def _within(hit, start_date, end_date):
+        try:
+            d = _dt.date.fromisoformat(str(hit[1].get("date")))
+            return start_date <= d <= end_date
+        except Exception:
+            return False
 
-    if not year_a_hits and not year_b_hits:
-        st.warning("No matching content for these years with current filters.")
+    if compare_mode == "Years":
+        years_avail = sorted(df["date"].dt.year.unique())
+        colA, colB = st.columns(2)
+        year_a = colA.selectbox("Year A", years_avail, index=0)
+        year_b = colB.selectbox("Year B", years_avail, index=min(1, len(years_avail)-1))
+
+        # Use the CURRENT filtered result universe (query + theme + sidebar date range)
+        year_a_hits = [h for h in hits if int(h[1].get("year", 0)) == int(year_a)]
+        year_b_hits = [h for h in hits if int(h[1].get("year", 0)) == int(year_b)]
+
+        label_a = f"{year_a}"
+        label_b = f"{year_b}"
+        ctx_a = _context(year_a_hits)
+        ctx_b = _context(year_b_hits)
+
+    else:  # Date ranges
+        # Range A defaults to the sidebar global range
+        colA, colB = st.columns(2)
+        rngA_from = colA.date_input("Range A — From", value=date_from,
+                                    min_value=df["date"].min().date(), max_value=df["date"].max().date())
+        rngA_to = colA.date_input("Range A — To", value=date_to,
+                                  min_value=df["date"].min().date(), max_value=df["date"].max().date())
+
+        # Auto-suggest Range B as the previous equal-length period; user can override
+        span_days = max(1, (rngA_to - rngA_from).days + 1)
+        prev_to = rngA_from - _dt.timedelta(days=1)
+        prev_from = prev_to - _dt.timedelta(days=span_days - 1)
+
+        rngB_from = colB.date_input("Range B — From",
+                                    value=max(df["date"].min().date(), prev_from),
+                                    min_value=df["date"].min().date(), max_value=df["date"].max().date())
+        rngB_to = colB.date_input("Range B — To",
+                                  value=max(df["date"].min().date(), prev_to),
+                                  min_value=df["date"].min().date(), max_value=df["date"].max().date())
+
+        range_a_hits = [h for h in hits if _within(h, rngA_from, rngA_to)]
+        range_b_hits = [h for h in hits if _within(h, rngB_from, rngB_to)]
+
+        label_a = f"{rngA_from.isoformat()} → {rngA_to.isoformat()}"
+        label_b = f"{rngB_from.isoformat()} → {rngB_to.isoformat()}"
+        ctx_a = _context(range_a_hits)
+        ctx_b = _context(range_b_hits)
+
+    # If no content in either bucket
+    if (compare_mode == "Years" and (not year_a_hits and not year_b_hits)) or \
+       (compare_mode == "Date ranges" and (not range_a_hits and not range_b_hits)):
+        st.warning("No matching content for these selections with the current filters. Try broadening the range or query.")
     else:
         sys = ("You are a senior IMF comms strategist. Using ONLY the provided context, write issue-focused analysis. "
                "Be concrete, policy-aware, and concise. Add (Month YYYY — Title) after points using the headers.")
         usr = f"""
 Topic: {query}
 
-Year {year_a} context:
+Period A: {label_a}
+Context:
 {ctx_a}
 
-Year {year_b} context:
+Period B: {label_b}
+Context:
 {ctx_b}
 
 Tasks:
-1) For {year_a}: list 4–6 issue headings with 1–2 sentence summaries each (no quotes).
-2) For {year_b}: list 4–6 issue headings with 1–2 sentence summaries each (no quotes).
+1) For Period A: list 4–6 issue headings with 1–2 sentence summaries each (no quotes).
+2) For Period B: list 4–6 issue headings with 1–2 sentence summaries each (no quotes).
 3) Messaging evolution: a short narrative on what gained emphasis, what was deemphasized, and any new issues. Cite headers as (Month YYYY — Title).
 """
         cmp_md = llm(sys, usr, model=model, max_tokens=900, temperature=0.3)
         st.markdown(cmp_md)
 
+    # Sources toggle
     with st.expander("Show sources (Quick Compare)"):
-        src = sources_from_hits(year_a_hits + year_b_hits)
-        for (d,t,l) in src:
+        if compare_mode == "Years":
+            src_hits = year_a_hits + year_b_hits
+        else:
+            src_hits = range_a_hits + range_b_hits
+        for (d,t,l) in sources_from_hits(src_hits):
             st.markdown(f"- {d} — [{t}]({l})")
+
 
 # ---------- Top Quotes tab ----------
 with tab_quotes:
