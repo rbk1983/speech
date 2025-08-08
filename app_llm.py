@@ -59,23 +59,18 @@ filters = {"themes": theme_filter} if theme_filter else {}
 # --- Retrieve top chunks
 if query.strip():
     hits = retrieve(query, index, metas, chunks, k=24, filters=filters)
+    # Enforce newest-first ordering in the UI, just in case
+    import datetime as _dt
+    def _dk(m):
+        try:
+            return _dt.datetime.fromisoformat(str(m.get("date","")))
+        except Exception:
+            return _dt.datetime.min
+    hits = sorted(hits, key=lambda t: _dk(t[1]), reverse=True)
     st.write(f"Found {len(hits)} relevant chunks.")
 else:
     hits = []
     st.info("Enter a topic to begin.")
-
-def join_chunks(hits_subset, limit=12, char_limit=900):
-    out = []
-    used = set()
-    for (idx, m, ch) in hits_subset[:limit]:
-        key = (m["date"], m["title"])
-        if key in used:
-            continue
-        used.add(key)
-        header = f"[{m['date']} — {m['title']}]({m['link']})"
-        excerpt = textwrap.shorten(ch.replace("\n"," "), width=char_limit, placeholder="…")
-        out.append(header + "\n" + excerpt)
-    return "\n\n".join(out)
 
 # --- Narrative Quick Compare (LLM)
 st.header("Narrative Quick Compare (LLM)")
