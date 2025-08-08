@@ -1,5 +1,4 @@
-# app_llm.py — Phase 2: Alignment, Rapid Response, Tone, Draft Assist, Stakeholders
-# Uses gpt-4o-mini / gpt-4o with fallback via rag_utils.llm, cached calls, and Plotly visuals.
+# app_llm.py — Phase 2 (patched): robust charts, defensive parsing, all features
 import os, datetime as _dt, hashlib
 import pandas as pd
 import streamlit as st
@@ -350,17 +349,25 @@ with tab_viz:
 with tab_align:
     st.subheader("Message Consistency & Alignment")
     playbook = load_playbook()
-    # Build compact context from current hits
     ctx = format_hits_for_context(hits_for_llm, limit=(ctx_limit+2))
 
-    # Radar data + narrative
     radar_df = alignment_radar_data(query, playbook, ctx, model_preferred)
-    if radar_df is not None and not radar_df.empty:
-        fig = px.line_polar(radar_df, r="score", theta="issue", line_close=True)
-        fig.update_traces(fill='toself')
+    # Robust plotting: need at least 3 rows and required columns
+    if radar_df is not None and not radar_df.empty and {"issue","score"}.issubset(set(radar_df.columns)) and len(radar_df) >= 3:
+        try:
+            fig = px.line_polar(radar_df, r="score", theta="issue", line_close=True)
+            fig.update_traces(fill='toself')
+            st.plotly_chart(fig, use_container_width=True)
+        except Exception:
+            # Fallback to bar
+            fig = px.bar(radar_df, x="issue", y="score")
+            st.plotly_chart(fig, use_container_width=True)
+    elif radar_df is not None and not radar_df.empty and {"issue","score"}.issubset(set(radar_df.columns)):
+        st.caption("Not enough issues for radar; showing bar chart instead.")
+        fig = px.bar(radar_df, x="issue", y="score")
         st.plotly_chart(fig, use_container_width=True)
     else:
-        st.info("No issues detected for radar. Try widening the date range or query.")
+        st.info("No issues detected for alignment chart. Try widening the date range or query.")
 
     nar = alignment_narrative(query, playbook, ctx, model_preferred)
     st.markdown(nar)
@@ -382,14 +389,20 @@ with tab_tone:
     st.subheader("Sentiment & Tone")
     ctx = format_hits_for_context(hits_for_llm, limit=(ctx_limit+6))
     ts = tone_time_series(query, ctx, model_preferred)
-    if not ts.empty:
-        fig = px.line(ts, x="date", y="score", color="tone", markers=True)
-        st.plotly_chart(fig, use_container_width=True)
+    if isinstance(ts, pd.DataFrame) and not ts.empty:
+        try:
+            fig = px.line(ts, x="date", y="score", color="tone", markers=True)
+            st.plotly_chart(fig, use_container_width=True)
+        except Exception:
+            st.info("Not enough data for tone time series.")
     hm = tone_heatmap_data(query, ctx, model_preferred)
-    if not hm.empty:
-        fig2 = px.imshow(hm.pivot_table(index="tone", columns="year", values="score", fill_value=0),
-                         aspect="auto", color_continuous_scale="Blues")
-        st.plotly_chart(fig2, use_container_width=True)
+    if isinstance(hm, pd.DataFrame) and not hm.empty:
+        try:
+            piv = hm.pivot_table(index="tone", columns="year", values="score", fill_value=0)
+            fig2 = px.imshow(piv, aspect="auto", color_continuous_scale="Blues")
+            st.plotly_chart(fig2, use_container_width=True)
+        except Exception:
+            st.info("Not enough data for tone heatmap.")
 
 # ---------------- Draft Assist tab ----------------
 with tab_draft:
@@ -433,7 +446,7 @@ with tab_stake:
     stakeholders = load_stakeholders()
     ctx = format_hits_for_context(hits_for_llm, limit=(ctx_limit+4))
     scores = stakeholder_scores(query, stakeholders, ctx, model_preferred)  # returns DataFrame
-    if not scores.empty:
+    if isinstance(scores, pd.DataFrame) and not scores.empty and {"stakeholder","score"}.issubset(set(scores.columns)):
         fig = px.bar(scores, x="stakeholder", y="score")
         st.plotly_chart(fig, use_container_width=True)
         nar = stakeholder_narrative(query, stakeholders, ctx, model_preferred)

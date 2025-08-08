@@ -1,16 +1,22 @@
-# phase2_utils.py — helpers for Phase 2 features
+# phase2_utils.py — helpers for Phase 2 features (patched)
 import hashlib, datetime as _dt
 import pandas as pd
 import yaml
+from io import StringIO
 from rag_utils import llm
 
 # ---------- Load YAML templates ----------
 def load_playbook(path="messaging_playbook.yaml"):
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
+            data = yaml.safe_load(f) or {}
+            # normalize structure
+            if "issues" not in data:
+                data["issues"] = {}
+            if "banned_phrases" not in data:
+                data["banned_phrases"] = []
+            return data
     except Exception:
-        # Minimal default
         return {
             "issues": {
                 "Climate finance": {"target": 0.9, "proof_points": ["RSF", "mitigation", "adaptation"]},
@@ -24,7 +30,10 @@ def load_playbook(path="messaging_playbook.yaml"):
 def load_stakeholders(path="stakeholders.yaml"):
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
+            data = yaml.safe_load(f) or {}
+            if "stakeholders" not in data:
+                data["stakeholders"] = {}
+            return data
     except Exception:
         return {
             "stakeholders": {
@@ -36,7 +45,7 @@ def load_stakeholders(path="stakeholders.yaml"):
             }
         }
 
-# ---------- Caching wrapper ----------
+# ---------- Tiny cache ----------
 _cache = {}
 def _cache_call(key, fn):
     if key in _cache:
@@ -45,12 +54,24 @@ def _cache_call(key, fn):
     _cache[key] = val
     return val
 
+def _safe_csv_to_df(text, expected_cols):
+    """Parse CSV robustly and ensure required cols exist."""
+    try:
+        df = pd.read_csv(StringIO(text))
+    except Exception:
+        return pd.DataFrame(columns=expected_cols)
+    # ensure columns
+    for c in expected_cols:
+        if c not in df.columns:
+            df[c] = None
+    return df[expected_cols]
+
 # ---------- Alignment (radar + narrative) ----------
 def alignment_radar_data(topic, playbook, context_md, model):
     issues = list((playbook.get("issues") or {}).keys())
     if not issues:
-        return pd.DataFrame()
-    sys = "You score alignment of provided excerpts to the given issues (0..1). Use only the context."
+        return pd.DataFrame(columns=["issue","score"])
+    sys = "Score alignment of provided excerpts to the given issues (0..1). Use only the context."
     usr = f"""Issues: {', '.join(issues)}
 Context:
 {context_md}
@@ -59,16 +80,14 @@ Return a CSV with columns: issue,score  (0..1)."""
     def run():
         text = llm(sys, usr, model=model, max_tokens=300, temperature=0.2)
         text = text[0] if isinstance(text, tuple) else text
-        try:
-            return pd.read_csv(pd.io.common.StringIO(text))
-        except Exception:
-            # fallback: evenly spread
-            return pd.DataFrame({"issue": issues, "score": [0.5]*len(issues)})
-    df = _cache_call(key, run)
-    # clamp
-    if "score" in df.columns:
-        df["score"] = df["score"].clip(0,1)
-    return df
+        df = _safe_csv_to_df(text, ["issue","score"])
+        # clean types
+        df["issue"] = df["issue"].astype(str).str.strip()
+        df["score"] = pd.to_numeric(df["score"], errors="coerce").fillna(0).clip(0,1)
+        # drop empties
+        df = df[df["issue"].str.len() > 0]
+        return df
+    return _cache_call(key, run)
 
 def alignment_narrative(topic, playbook, context_md, model):
     sys = ("You are a comms strategist. Using ONLY context and playbook issues, write a short analysis of alignment: "
@@ -119,18 +138,13 @@ Include 6–20 rows total."""
     def run():
         text = llm(sys, usr, model=model, max_tokens=400, temperature=0.2)
         text = text[0] if isinstance(text, tuple) else text
-        try:
-            df = pd.read_csv(pd.io.common.StringIO(text))
-            # basic cleaning
-            if "date" in df.columns:
-                df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
-            if "score" in df.columns:
-                df["score"] = pd.to_numeric(df["score"], errors="coerce").fillna(0).clip(0,1)
-            if "tone" in df.columns:
-                df["tone"] = df["tone"].str.lower().str.strip()
-            return df.dropna(subset=["date"])
-        except Exception:
-            return pd.DataFrame(columns=["date","tone","score"])
+        df = _safe_csv_to_df(text, ["date","tone","score"])
+        # basic cleaning
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df["tone"] = df["tone"].astype(str).str.lower().str.strip()
+        df["score"] = pd.to_numeric(df["score"], errors="coerce").fillna(0).clip(0,1)
+        df = df.dropna(subset=["date"])
+        return df
     return _cache_call(key, run)
 
 def tone_heatmap_data(topic, context_md, model):
@@ -146,17 +160,11 @@ Return CSV columns: year,tone,score
     def run():
         text = llm(sys, usr, model=model, max_tokens=350, temperature=0.2)
         text = text[0] if isinstance(text, tuple) else text
-        try:
-            df = pd.read_csv(pd.io.common.StringIO(text))
-            if "year" in df.columns:
-                df["year"] = pd.to_numeric(df["year"], errors="coerce").astype("Int64")
-            if "score" in df.columns:
-                df["score"] = pd.to_numeric(df["score"], errors="coerce").fillna(0).clip(0,1)
-            if "tone" in df.columns:
-                df["tone"] = df["tone"].str.lower().str.strip()
-            return df.dropna(subset=["year"])
-        except Exception:
-            return pd.DataFrame(columns=["year","tone","score"])
+        df = _safe_csv_to_df(text, ["year","tone","score"])
+        df["year"] = pd.to_numeric(df["year"], errors="coerce").astype("Int64")
+        df["tone"] = df["tone"].astype(str).str.lower().str.strip()
+        df["score"] = pd.to_numeric(df["score"], errors="coerce").fillna(0).clip(0,1) if "score" in df else 0
+        return df.dropna(subset=["year"])
     return _cache_call(key, run)
 
 # ---------- Stakeholders ----------
@@ -173,13 +181,11 @@ Return CSV columns: stakeholder,score  (0..1 for relevance)."""
     def run():
         text = llm(sys, usr, model=model, max_tokens=300, temperature=0.2)
         text = text[0] if isinstance(text, tuple) else text
-        try:
-            df = pd.read_csv(pd.io.common.StringIO(text))
-            if "score" in df.columns:
-                df["score"] = pd.to_numeric(df["score"], errors="coerce").fillna(0).clip(0,1)
-            return df
-        except Exception:
-            return pd.DataFrame({"stakeholder": names, "score": [0.5]*len(names)})
+        df = _safe_csv_to_df(text, ["stakeholder","score"])
+        df["stakeholder"] = df["stakeholder"].astype(str).str.strip()
+        df["score"] = pd.to_numeric(df["score"], errors="coerce").fillna(0).clip(0,1)
+        df = df[df["stakeholder"].str.len() > 0]
+        return df
     return _cache_call(key, run)
 
 def stakeholder_narrative(topic, stakeholders_yaml, context_md, model):
