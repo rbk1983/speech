@@ -2,7 +2,9 @@
 import os, datetime as _dt
 import streamlit as st
 import plotly.express as px
+import pandas as pd     # ← add this line
 from rag_utils import load_df, load_index, retrieve, sources_from_hits, format_hits_for_context, llm
+
 
 st.set_page_config(page_title="Kristalina Speech Intelligence (LLM)", layout="wide")
 st.title("Kristalina Georgieva — Speech Intelligence")
