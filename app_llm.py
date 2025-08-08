@@ -135,15 +135,12 @@ with tab_res:
         for (d,t,l) in sources_from_hits(hits):
             st.markdown(f"- {d} — [{t}]({l})")
 
-# ---------- Quick Compare tab ----------
-# ---------- Quick Compare tab ----------
+# ---------- Thematic Evolution tab (single date range) ----------
 with tab_compare:
-    st.subheader("Thematic Quick Compare (LLM)")
+    st.subheader("Thematic Evolution (LLM) — Date Range")
 
-    compare_mode = st.radio("Compare mode", ["Years", "Date ranges"], horizontal=True)
-
-    def _context(hlist, limit=ctx_limit):
-        return format_hits_for_context(hlist, limit=limit, char_limit=900)
+    # We use the global sidebar date range: date_from, date_to
+    st.caption(f"Analyzing: **{date_from.isoformat()} → {date_to.isoformat()}**")
 
     def _within(hit, start_date, end_date):
         try:
@@ -152,83 +149,60 @@ with tab_compare:
         except Exception:
             return False
 
-    if compare_mode == "Years":
-        years_avail = sorted(df["date"].dt.year.unique())
-        colA, colB = st.columns(2)
-        year_a = colA.selectbox("Year A", years_avail, index=0)
-        year_b = colB.selectbox("Year B", years_avail, index=min(1, len(years_avail)-1))
+    # Use the current filtered result universe (query + theme + sidebar range)
+    range_hits = [h for h in hits if _within(h, date_from, date_to)]
 
-        # Use the CURRENT filtered result universe (query + theme + sidebar date range)
-        year_a_hits = [h for h in hits if int(h[1].get("year", 0)) == int(year_a)]
-        year_b_hits = [h for h in hits if int(h[1].get("year", 0)) == int(year_b)]
-
-        label_a = f"{year_a}"
-        label_b = f"{year_b}"
-        ctx_a = _context(year_a_hits)
-        ctx_b = _context(year_b_hits)
-
-    else:  # Date ranges
-        # Range A defaults to the sidebar global range
-        colA, colB = st.columns(2)
-        rngA_from = colA.date_input("Range A — From", value=date_from,
-                                    min_value=df["date"].min().date(), max_value=df["date"].max().date())
-        rngA_to = colA.date_input("Range A — To", value=date_to,
-                                  min_value=df["date"].min().date(), max_value=df["date"].max().date())
-
-        # Auto-suggest Range B as the previous equal-length period; user can override
-        span_days = max(1, (rngA_to - rngA_from).days + 1)
-        prev_to = rngA_from - _dt.timedelta(days=1)
-        prev_from = prev_to - _dt.timedelta(days=span_days - 1)
-
-        rngB_from = colB.date_input("Range B — From",
-                                    value=max(df["date"].min().date(), prev_from),
-                                    min_value=df["date"].min().date(), max_value=df["date"].max().date())
-        rngB_to = colB.date_input("Range B — To",
-                                  value=max(df["date"].min().date(), prev_to),
-                                  min_value=df["date"].min().date(), max_value=df["date"].max().date())
-
-        range_a_hits = [h for h in hits if _within(h, rngA_from, rngA_to)]
-        range_b_hits = [h for h in hits if _within(h, rngB_from, rngB_to)]
-
-        label_a = f"{rngA_from.isoformat()} → {rngA_to.isoformat()}"
-        label_b = f"{rngB_from.isoformat()} → {rngB_to.isoformat()}"
-        ctx_a = _context(range_a_hits)
-        ctx_b = _context(range_b_hits)
-
-    # If no content in either bucket
-    if (compare_mode == "Years" and (not year_a_hits and not year_b_hits)) or \
-       (compare_mode == "Date ranges" and (not range_a_hits and not range_b_hits)):
-        st.warning("No matching content for these selections with the current filters. Try broadening the range or query.")
+    if not range_hits:
+        st.warning("No matching content in this date range with current filters. Try broadening the range or removing theme filters.")
     else:
-        sys = ("You are a senior IMF comms strategist. Using ONLY the provided context, write issue-focused analysis. "
-               "Be concrete, policy-aware, and concise. Add (Month YYYY — Title) after points using the headers.")
-        usr = f"""
+        # Group retrieved hits by year (ascending)
+        by_year = {}
+        for (idx, m, ch) in range_hits:
+            y = int(m.get("year", 0) or str(m.get("date",""))[:4] or 0)
+            if y == 0: 
+                continue
+            by_year.setdefault(y, []).append((idx, m, ch))
+        years_asc = sorted(by_year.keys())
+
+        # Build a structured context: "Year YYYY" section with several excerpts
+        # Use a modest limit per year so we don't overload the model
+        per_year_limit = max(4, min(10, 2 * (18 if view_mode == "Depth" else 10) // max(1, len(years_asc))))
+        year_sections = []
+        for y in years_asc:
+            ctx = format_hits_for_context(by_year[y], limit=per_year_limit, char_limit=900)
+            if ctx.strip():
+                year_sections.append(f"=== Year {y} ===\n{ctx}")
+        full_ctx = "\n\n".join(year_sections) if year_sections else "(no matching context)"
+
+        # LLM prompt: issues per year + evolution narrative across the whole span
+        system = (
+            "You are a senior IMF communications strategist. Using ONLY the provided context, "
+            "analyze how messaging evolved across the date range. Focus on substance (policies, instruments, risks, rationales), "
+            "avoid speculation, and keep it concise and media-ready. When referencing specifics, add (Month YYYY — Title) "
+            "based on the headers."
+        )
+        user = f"""
 Topic: {query}
 
-Period A: {label_a}
-Context:
-{ctx_a}
+Date range: {date_from.isoformat()} → {date_to.isoformat()}
 
-Period B: {label_b}
-Context:
-{ctx_b}
+Context grouped by year (each item starts with [YYYY-MM-DD — Title](link)):
+{full_ctx}
 
 Tasks:
-1) For Period A: list 4–6 issue headings with 1–2 sentence summaries each (no quotes).
-2) For Period B: list 4–6 issue headings with 1–2 sentence summaries each (no quotes).
-3) Messaging evolution: a short narrative on what gained emphasis, what was deemphasized, and any new issues. Cite headers as (Month YYYY — Title).
+1) For each year in the range, list 4–6 ISSUE headings with 1–2 sentence summaries each (no quotes). Use clear, non-overlapping issues.
+2) Messaging evolution (range-wide): a short, concrete narrative of what gained emphasis, what was deemphasized, and any NEW issues that emerged.
+3) (Optional) Mini shift timeline (3–6 bullets): Month YYYY — Title — one clause on the nature of the shift.
+
+Return clean Markdown with sections: "Per-Year Focus", "Messaging Evolution", and "Shift Timeline" (only include the last if warranted).
 """
-        cmp_md = llm(sys, usr, model=model, max_tokens=900, temperature=0.3)
+        cmp_md = llm(system, user, model=model, max_tokens=1100, temperature=0.3)
         st.markdown(cmp_md)
 
-    # Sources toggle
-    with st.expander("Show sources (Quick Compare)"):
-        if compare_mode == "Years":
-            src_hits = year_a_hits + year_b_hits
-        else:
-            src_hits = range_a_hits + range_b_hits
-        for (d,t,l) in sources_from_hits(src_hits):
-            st.markdown(f"- {d} — [{t}]({l})")
+        with st.expander("Show sources (Thematic Evolution)"):
+            for (d, t, l) in sources_from_hits(range_hits):
+                st.markdown(f"- {d} — [{t}]({l})")
+
 
 
 # ---------- Top Quotes tab ----------
