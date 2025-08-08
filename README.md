@@ -1,4 +1,4 @@
-# Kristalina Georgieva Speech Intelligence App
+# MD Speech Intelligence App
 
 This app lets you search, compare, and analyze Kristalina Georgieva's speeches using LLM-powered summaries, thematic analysis, and quote extraction.
 
