@@ -1,4 +1,5 @@
-# app_llm.py — Phase 1 (fast GPT-5, caching, polished UI, visuals)
+# app_llm.py — Streamlit app with date-range Thematic Evolution, faster GPT-4.1-mini default,
+# caching, fallbacks, polished UI, and interactive visuals.
 import os, datetime as _dt, hashlib
 import pandas as pd
 import streamlit as st
@@ -12,7 +13,7 @@ from rag_utils import (
 st.set_page_config(page_title="Kristalina Speech Intelligence (LLM)", layout="wide")
 st.title("Kristalina Georgieva — Speech Intelligence")
 
-# ---------- Ensure index exists ----------
+# ---------------- Ensure index exists ----------------
 def _index_files_present():
     return all(os.path.exists(p) for p in ["index.faiss", "meta.json", "chunks.json"])
 
@@ -36,7 +37,7 @@ def _ensure_index():
 
 _ensure_index()
 
-# ---------- Load ----------
+# ---------------- Load data/index ----------------
 @st.cache_resource
 def _load_everything():
     df = load_df()
@@ -45,7 +46,7 @@ def _load_everything():
 
 df, index, metas, chunks = _load_everything()
 
-# ---------- Sidebar controls ----------
+# ---------------- Sidebar controls ----------------
 with st.sidebar:
     st.header("Search Controls")
     query = st.text_input("Topic", placeholder="e.g., artificial intelligence, climate finance")
@@ -66,7 +67,7 @@ with st.sidebar:
     view_mode = st.radio(
         "LLM Mode",
         ["Speed", "Depth"],
-        help="Speed: GPT-5-mini with smaller context. Depth: GPT-5 with more context.",
+        help="Speed: GPT-4.1-mini (fallbacks if unavailable) with smaller context. Depth: GPT-4.1 with more context.",
         horizontal=True
     )
 
@@ -103,24 +104,44 @@ theme_filter = st.multiselect("Filter by theme (optional)", all_themes, help="Cl
 
 filters = {"themes": theme_filter, "date_from": date_from, "date_to": date_to}
 
-# ---------- Model choice / context limits ----------
+# ---------------- Model choice / context limits ----------------
+# Default to GPT-4.1 family for speed/availability, with smaller contexts in Speed mode.
 if view_mode == "Depth":
-    model = "gpt-5"        # higher quality
-    ctx_limit = 12         # how many items to include in LLM context sections
+    model_preferred = "gpt-4.1"      # higher quality
+    ctx_limit = 12                   # how many items to include in LLM context sections
     per_item_tokens = 1000
 else:
-    model = "gpt-5-mini"   # faster & cheaper
+    model_preferred = "gpt-4.1-mini" # faster & cheaper
     ctx_limit = 8
     per_item_tokens = 700
 
-# ---------- Cached LLM wrapper ----------
+# ---------------- Cached LLM wrapper with fallback & model badge ----------------
 @st.cache_data(show_spinner=False)
 def llm_cached(cache_key: str, system: str, user: str, model: str, max_tokens: int, temperature: float):
-    # Streamlit caches on the function signature; we also derive a hash key if needed
+    """Call llm() with robust fallback and return (text, model_used). Works even if rag_utils.llm returns just text."""
     _ = hashlib.sha256((cache_key + system + user + model + str(max_tokens) + str(temperature)).encode("utf-8")).hexdigest()
-    return llm(system, user, model=model, max_tokens=max_tokens, temperature=temperature)
+    # 1) Try preferred model
+    try:
+        resp = llm(system, user, model=model, max_tokens=max_tokens, temperature=temperature)
+        if isinstance(resp, tuple) and len(resp) == 2:
+            return resp  # (text, model_used) from rag_utils
+        else:
+            return (resp, model)  # assume resp is text
+    except Exception:
+        # 2) Fallbacks in order
+        for fb in ["gpt-4o-mini", "gpt-4o"]:
+            try:
+                resp = llm(system, user, model=fb, max_tokens=max_tokens, temperature=temperature)
+                if isinstance(resp, tuple) and len(resp) == 2:
+                    return resp
+                else:
+                    return (resp, fb)
+            except Exception:
+                continue
+        # If all fail, raise
+        raise
 
-# ---------- Retrieval ----------
+# ---------------- Retrieval ----------------
 if not query or not query.strip():
     st.info("Enter a topic in the sidebar to begin.")
     st.stop()
@@ -144,26 +165,27 @@ with c2:
     if st.button("Next ▶", disabled=offset + limit >= total):
         st.session_state.page_offset = offset + limit; st.rerun()
 
-# ---------- Tabs ----------
+# ---------------- Tabs ----------------
 tab_res, tab_compare, tab_quotes, tab_brief, tab_viz = st.tabs(
     ["Results", "Thematic Evolution", "Top Quotes", "Briefing Pack", "Analytics"]
 )
 
-# ---------- Results tab ----------
+# ---------------- Results tab ----------------
 with tab_res:
     st.subheader("Most Relevant Speeches" if sort_key=="relevance" else "Most Recent Speeches")
     for (_, m, ch) in hits:
         st.markdown(f"**{m.get('date')} — [{m.get('title')}]({m.get('link')})**")
         sys = "You are an IMF speech analyst. Produce a concise snippet and 3–5 bullets grounded only in the excerpt."
         usr = f"Excerpt:\n{ch}\n\nReturn a 1–2 sentence snippet, then 3–5 bullets of key points."
-        key = f"res::{m.get('date')}::{m.get('title')}::{model}"
-        md = llm_cached(key, sys, usr, model=model, max_tokens=per_item_tokens, temperature=0.2)
+        key = f"res::{m.get('date')}::{m.get('title')}::{model_preferred}"
+        (md, used_model) = llm_cached(key, sys, usr, model=model_preferred, max_tokens=per_item_tokens, temperature=0.2)
         st.markdown(md)
+        st.caption(f"Model: {used_model}")
     with st.expander("Show sources used on this page"):
         for (d,t,l) in sources_from_hits(hits):
             st.markdown(f"- {d} — [{t}]({l})")
 
-# ---------- Thematic Evolution tab (single date range) ----------
+# ---------------- Thematic Evolution tab (single date range) ----------------
 with tab_compare:
     st.subheader("Thematic Evolution (LLM) — Date Range")
     st.caption(f"Analyzing: **{date_from.isoformat()} → {date_to.isoformat()}**")
@@ -189,7 +211,7 @@ with tab_compare:
         years_asc = sorted(by_year.keys())
 
         # Smaller per-year cap to keep prompts snappy
-        per_year_limit = max(3, min(6, ctx_limit // max(1, len(years_asc))))
+        per_year_limit = max(3, min(6, (12 if view_mode=="Depth" else 8) // max(1, len(years_asc))))
         year_sections = []
         for y in years_asc:
             ctx = format_hits_for_context(by_year[y], limit=per_year_limit, char_limit=900)
@@ -211,9 +233,10 @@ Context grouped by year (each item starts with [YYYY-MM-DD — Title](link)):
 
 Task: For each year in the range, list 3–5 ISSUE headings with 1–2 sentence summaries (no quotes). Keep it concise.
 """
-        per_year_md = llm_cached(f"peryear::{query}::{date_from}::{date_to}::{model}", sys1, usr1, model=model, max_tokens=per_item_tokens, temperature=0.2)
+        (per_year_md, used_model1) = llm_cached(f"peryear::{query}::{date_from}::{date_to}::{model_preferred}", sys1, usr1, model=model_preferred, max_tokens=per_item_tokens, temperature=0.2)
         st.markdown("### Per-Year Focus")
         st.markdown(per_year_md)
+        st.caption(f"Model: {used_model1}")
 
         # 2) Evolution Narrative
         sys2 = ("You analyze evolution across the full date range. Use ONLY context. "
@@ -227,18 +250,19 @@ Use the same context as above.
 
 Task: Write a short 'Messaging Evolution' narrative for the whole range (6–10 sentences, crisp).
 """
-        evol_md = llm_cached(f"evol::{query}::{date_from}::{date_to}::{model}", sys2, usr2, model=model, max_tokens=per_item_tokens, temperature=0.2)
+        (evol_md, used_model2) = llm_cached(f"evol::{query}::{date_from}::{date_to}::{model_preferred}", sys2, usr2, model=model_preferred, max_tokens=per_item_tokens, temperature=0.2)
         st.markdown("### Messaging Evolution")
         st.markdown(evol_md)
+        st.caption(f"Model: {used_model2}")
 
         with st.expander("Show sources (Thematic Evolution)"):
             for (d, t, l) in sources_from_hits(range_hits):
                 st.markdown(f"- {d} — [{t}]({l})")
 
-# ---------- Top Quotes tab ----------
+# ---------------- Top Quotes tab ----------------
 with tab_quotes:
     st.subheader("Top Quotes (LLM)")
-    ctx_quotes = format_hits_for_context(hits_for_llm, limit=ctx_limit+2)
+    ctx_quotes = format_hits_for_context(hits_for_llm, limit=(ctx_limit+2))
     sys_q = ("You extract on-topic quotes. Use ONLY provided context; return exact sentences. "
              "Each bullet ends with (Month YYYY — Title) and includes the link from the header. "
              "Prioritize quotes that clearly address the user's topic.")
@@ -251,16 +275,17 @@ Context:
 Task:
 Return exactly 5 strong on-topic quotes (1–3 sentences each). Each bullet ends with (Month YYYY — Title).
 """
-    quotes_md = llm_cached(f"quotes::{query}::{date_from}::{date_to}::{model}", sys_q, usr_q, model=model, max_tokens=per_item_tokens, temperature=0.2)
+    (quotes_md, used_model3) = llm_cached(f"quotes::{query}::{date_from}::{date_to}::{model_preferred}", sys_q, usr_q, model=model_preferred, max_tokens=per_item_tokens, temperature=0.2)
     st.markdown(quotes_md)
+    st.caption(f"Model: {used_model3}")
     with st.expander("Show sources (Quotes)"):
         for (d,t,l) in sources_from_hits(hits_for_llm):
             st.markdown(f"- {d} — [{t}]({l})")
 
-# ---------- Briefing Pack tab ----------
+# ---------------- Briefing Pack tab ----------------
 with tab_brief:
     st.subheader("Briefing Pack (LLM)")
-    ctx_brief = format_hits_for_context(hits_for_llm, limit=ctx_limit+4)
+    ctx_brief = format_hits_for_context(hits_for_llm, limit=(ctx_limit+4))
     sys_b = "You are drafting a media-ready briefing grounded ONLY in provided context."
     usr_b = f"""
 Topic: {query}
@@ -275,11 +300,12 @@ Tasks:
 - Short timeline bullets (Month YYYY — Title).
 Return clean Markdown.
 """
-    brief_md = llm_cached(f"brief::{query}::{date_from}::{date_to}::{model}", sys_b, usr_b, model=model, max_tokens=per_item_tokens+200, temperature=0.25)
+    (brief_md, used_model4) = llm_cached(f"brief::{query}::{date_from}::{date_to}::{model_preferred}", sys_b, usr_b, model=model_preferred, max_tokens=per_item_tokens+200, temperature=0.25)
     st.markdown(brief_md)
+    st.caption(f"Model: {used_model4}")
     st.download_button("Download briefing (Markdown)", brief_md.encode("utf-8"), file_name="briefing.md", mime="text/markdown")
 
-# ---------- Analytics tab (visuals) ----------
+# ---------------- Analytics tab (visuals) ----------------
 with tab_viz:
     st.subheader("Analytics & Visuals")
 
