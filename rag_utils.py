@@ -39,9 +39,9 @@ def retrieve(query, index, metas, chunks, k=16, filters=None):
 
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-    # Embed query
+    # >>> Use the SAME embedding model as used to build the index <<<
     qv = client.embeddings.create(
-        model="text-embedding-3-small",
+        model="text-embedding-3-large",   # <-- match build_index.py
         input=query
     ).data[0].embedding
 
