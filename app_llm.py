@@ -1,5 +1,5 @@
-# app_llm.py — Simplified UI + Ingest & Sync tab
-import os, datetime as _dt, hashlib, math, json, shutil, re
+# app_llm.py — Ingest & Sync with YouTube/Vimeo fetch + Year-by-Year Evolution + Pagination
+import os, datetime as _dt, hashlib, math, json, re, tempfile
 from pathlib import Path
 import pandas as pd
 import streamlit as st
@@ -43,8 +43,18 @@ try:
 except Exception:
     BeautifulSoup = None
 
+# yt-dlp for YouTube/Vimeo/audio fetch
 try:
-    from openai import OpenAI  # whisper fallback (cloud)
+    import yt_dlp  # type: ignore
+    _YTDLP_OK = True
+except Exception:
+    yt_dlp = None
+    _YTDLP_OK = False
+
+# FFMPEG presence improves yt-dlp audio extraction; most envs include it.
+# OpenAI Whisper fallback
+try:
+    from openai import OpenAI
     _OPENAI_OK = True
 except Exception:
     _OPENAI_OK = False
@@ -65,16 +75,13 @@ def transcribe_bytes(file_bytes: bytes, filename: str) -> str:
             raise RuntimeError(f"whisper_transcribe failed: {e}")
     if not _OPENAI_OK or not os.getenv("OPENAI_API_KEY"):
         raise RuntimeError("Transcription unavailable: set OPENAI_API_KEY or add a whisper_transcribe helper.")
-    # Minimal OpenAI Whisper v1 usage (non-streaming)
     client = OpenAI()
-    import tempfile
     with tempfile.NamedTemporaryFile(delete=False) as tmp:
         tmp.write(file_bytes)
         tmp.flush()
         tmp_name = tmp.name
     try:
         with open(tmp_name, "rb") as f:
-            # model name may vary; adjust if your account uses a different one
             transcript = client.audio.transcriptions.create(model="whisper-1", file=f)
         return transcript.text
     finally:
@@ -84,7 +91,7 @@ def transcribe_bytes(file_bytes: bytes, filename: str) -> str:
 def doc_to_text(path: Path) -> str:
     """Convert supported docs to raw text."""
     suffix = path.suffix.lower()
-    if suffix == ".txt" or suffix == ".md":
+    if suffix in (".txt", ".md"):
         return path.read_text(encoding="utf-8", errors="ignore")
     if suffix == ".docx":
         if not docx2txt:
@@ -94,7 +101,7 @@ def doc_to_text(path: Path) -> str:
         if not pdfminer_high:
             raise RuntimeError("pdfminer.six not installed; cannot parse .pdf.")
         return pdfminer_high.extract_text(str(path)) or ""
-    if suffix in [".html", ".htm"]:
+    if suffix in (".html", ".htm"):
         if not BeautifulSoup:
             raise RuntimeError("bs4 not installed; cannot parse .html.")
         html = path.read_text(encoding="utf-8", errors="ignore")
@@ -102,8 +109,46 @@ def doc_to_text(path: Path) -> str:
         return soup.get_text(separator="\n")
     raise RuntimeError(f"Unsupported document type: {suffix}")
 
+def ytdlp_fetch_audio(url: str, out_dir: Path) -> dict:
+    """Download best audio from a URL (YouTube/Vimeo/etc.) using yt-dlp.
+    Returns {'path': Path, 'title': str, 'ext': str, 'uploader': str, 'upload_date': 'YYYYMMDD'}
+    """
+    if not _YTDLP_OK:
+        raise RuntimeError("yt-dlp not installed. Install with: pip install yt-dlp")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": str(out_dir / "%(title).200B.%(ext)s"),
+        "noprogress": True,
+        "quiet": True,
+        "geo_bypass": True,
+        "nocheckcertificate": True,
+        "restrictfilenames": False,
+        "ignoreerrors": False,
+        "postprocessors": [
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
+        ],
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        if info is None:
+            raise RuntimeError("yt-dlp failed to extract media info.")
+        if "entries" in info and info["entries"]:
+            info = next(e for e in info["entries"] if e)  # first valid entry
+        title = info.get("title") or "audio"
+        upload_date = info.get("upload_date")  # YYYYMMDD
+        uploader = info.get("uploader") or info.get("channel")
+        # locate resulting mp3
+        candidates = list(out_dir.glob(f"{title}*.mp3"))
+        if not candidates:
+            candidates = sorted(out_dir.glob("*.mp3"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not candidates:
+            raise RuntimeError("Audio file not found after download.")
+        path = candidates[0]
+        return {"path": path, "title": title, "ext": path.suffix.lstrip("."), "uploader": uploader, "upload_date": upload_date}
+
 # ----- Defaults (kept simple) -----
-PER_ITEM_TOKENS = 400   # Longer = richer bullets/snippets (more cost); Shorter = terser (cheaper)
+PER_ITEM_TOKENS = 400   # Longer = richer bullets/snippets; shorter = terser (cheaper)
 DEFAULT_MODEL   = "gpt-4o-mini"
 
 # Cache for LLM results
@@ -168,6 +213,7 @@ st.markdown("""
 }
 .card h4{ margin: 0 0 .25rem 0; }
 .small { font-size: 0.9rem; color: #666; }
+code { background: rgba(0,0,0,.04); padding: 0 .25rem; border-radius: 4px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -389,12 +435,12 @@ with tab_res:
                 st.download_button("Download sources (.txt)", all_sources_text.encode("utf-8"),
                                    file_name="sources.txt", mime="text/plain")
 
-# ---------------- Thematic Evolution (Depth default) ----------------
+# ---------------- Thematic Evolution (year-by-year talking points + narrative) ----------------
 with tab_comp:
     if not speeches:
         st.info("Enter a search to analyze thematic evolution.")
     else:
-        st.subheader("Thematic Evolution (LLM) — Date Range")
+        st.subheader("Thematic Evolution (LLM) — Year-by-Year Talking Points")
         st.caption(f"Analyzing: **{filters['date_from'].isoformat()} → {filters['date_to'].isoformat()}**")
 
         def _within(meta, start_date, end_date):
@@ -405,45 +451,89 @@ with tab_comp:
             except Exception:
                 return False
 
-        range_items = [sp for sp in page_items if _within(sp["meta"], filters['date_from'], filters['date_to'])]
+        # Use ALL matched speeches in the chosen date range (not just current page)
+        range_items = [sp for sp in speeches if _within(sp["meta"], filters['date_from'], filters['date_to'])]
 
         if not range_items:
-            st.warning("No matching content on this page in this date range. Try moving pages or broaden the range.")
+            st.warning("No matching content in this date range. Try broadening the range.")
         else:
-            ctx_range = format_hits_for_context(_to_hits(range_items), limit=14)
+            # Group by year, preserving newest-first within each year
+            def _year_of(meta):
+                try:
+                    return int(str(meta.get("date"))[:4])
+                except Exception:
+                    return None
+
+            by_year = {}
+            for sp in range_items:
+                y = _year_of(sp["meta"])
+                if not y:
+                    continue
+                by_year.setdefault(y, []).append(sp)
+
+            # Sort years ascending and items within each year by date desc
+            years_asc = sorted(by_year.keys())
+            for y in years_asc:
+                by_year[y] = sorted(by_year[y], key=lambda sp: _parse_date(sp["meta"].get("date")), reverse=True)
+
+            # Build per-year context with a reasonable cap per year
+            per_year_limit = 8 if len(years_asc) <= 2 else max(4, 14 // max(1, len(years_asc)))
+            year_sections = []
+            for y in years_asc:
+                hits = _to_hits(by_year[y][:per_year_limit])
+                ctx = format_hits_for_context(hits, limit=per_year_limit, char_limit=1100)
+                if ctx.strip():
+                    year_sections.append(f"=== Year {y} ===\n{ctx}")
+            full_ctx = "\n\n".join(year_sections) if year_sections else "(no matching context)"
+
+            # 1) Year-by-year talking points
             sys_focus = (
-                "You are a senior IMF communications strategist. Using ONLY the provided context, "
-                "list key issue-focused takeaways for this date range."
+                "You are a senior IMF communications strategist. Using ONLY the provided context grouped by year, "
+                "produce clear, issue-focused talking points for each year. Do not invent facts. "
+                "When useful, cite with (Month YYYY — Title) derived from the headers in the context."
             )
             usr_focus = f"""Topic: {query}
 
 Date range: {filters['date_from'].isoformat()} → {filters['date_to'].isoformat()}
 
-Context:
-{ctx_range}
+Context grouped by year (each item starts with [YYYY-MM-DD — Title](link)):
+{full_ctx}
 
-Task: List 3–5 ISSUE headings with 1–2 sentence summaries (no quotes)."""
-            st.markdown("### Focus")
+Task:
+- For each year present in the context, output a heading "### Year YYYY"
+- Under each year, list 4–7 concise bullets of the **key talking points** that year, grounded strictly in the context.
+- Bullets should be crisp, policy-relevant, and non-overlapping.
+- If appropriate, include short cite tags like (Mar 2024 — Global Economy) using the header info.
+Return clean Markdown only.
+"""
+            st.markdown("### Year-by-Year Talking Points")
             (focus_md, used_model1) = llm_cached(
-                f"focus::{query}::{filters['date_from']}::{filters['date_to']}::{DEFAULT_MODEL}",
-                sys_focus, usr_focus, model=DEFAULT_MODEL, max_tokens=PER_ITEM_TOKENS,
+                f"peryear_tps::{query}::{filters['date_from']}::{filters['date_to']}::{DEFAULT_MODEL}",
+                sys_focus, usr_focus, model=DEFAULT_MODEL, max_tokens=PER_ITEM_TOKENS+150,
                 temperature=0.2, stream=True)
             st.caption(f"Model: {used_model1}")
 
-            sys2 = ("You analyze evolution across the full date range. Use ONLY context. "
-                    "Be concrete: what gained emphasis, what was deemphasized, any NEW issues. "
-                    "Cite with (Month YYYY — Title) based on headers.")
-            usr2 = f"""Topic: {query}
+            # 2) Messaging evolution narrative for the whole interval
+            sys_evol = (
+                "Analyze how messaging evolved across the entire date range. Use ONLY the same context. "
+                "Be concrete about shifts in emphasis, new themes that emerged, and any themes that receded. "
+                "Cite with (Month YYYY — Title) where helpful. Avoid speculation."
+            )
+            usr_evol = f"""Topic: {query}
 Range: {filters['date_from'].isoformat()} → {filters['date_to'].isoformat()}
 
-Context:
-{ctx_range}
+Same context as above:
+{full_ctx}
 
-Task: Write a short 'Messaging Evolution' narrative for the range (6–10 sentences, crisp)."""
-            st.markdown("### Messaging Evolution")
+Task:
+- Write a concise narrative (6–10 sentences) explaining how the **talking points shifted or held steady** over time.
+- Be specific about what rose/fell in prominence and when.
+Return a compact paragraph in Markdown.
+"""
+            st.markdown("### Messaging Evolution (Narrative)")
             (evol_md, used_model2) = llm_cached(
-                f"evol::{query}::{filters['date_from']}::{filters['date_to']}::{DEFAULT_MODEL}",
-                sys2, usr2, model=DEFAULT_MODEL, max_tokens=PER_ITEM_TOKENS,
+                f"evolution_narr::{query}::{filters['date_from']}::{filters['date_to']}::{DEFAULT_MODEL}",
+                sys_evol, usr_evol, model=DEFAULT_MODEL, max_tokens=PER_ITEM_TOKENS,
                 temperature=0.2, stream=True)
             st.caption(f"Model: {used_model2}")
 
@@ -458,7 +548,7 @@ if _HAS_P3:
             st.info("Enter a search above to view trajectory analysis.")
         else:
             st.subheader("Messaging Trajectory")
-            ctx = format_hits_for_context(_to_hits(page_items), limit=14)
+            ctx = format_hits_for_context(_to_hits(speeches[:30]), limit=18)
             series = build_issue_trajectory(query, ctx, DEFAULT_MODEL)  # DataFrame: year, issue, share
             if not series.empty:
                 fig = px.area(series, x="year", y="share", color="issue", groupnorm="fraction")
@@ -589,8 +679,9 @@ Return clean Markdown."""
 with tab_ing:
     st.subheader("Ingest & Sync")
     st.markdown(
-        "<div class='small'>Upload new sources (PDF, DOCX, TXT/MD, HTML, audio/video). "
-        "They will be stored under <code>./corpus/</code>, normalized to text, and the index can be rebuilt. "
+        "<div class='small'>Upload new sources (PDF, DOCX, TXT/MD, HTML, audio/video) or paste a YouTube/Vimeo URL. "
+        "All originals go to <code>./corpus/raw/</code>, normalized text to <code>./corpus/processed/</code>, "
+        "and metadata JSON to <code>./corpus/meta/</code>. After ingest you can rebuild the index. "
         "If this folder is a Git repo with a remote, I’ll try to commit & push.</div>", unsafe_allow_html=True
     )
 
@@ -605,13 +696,21 @@ with tab_ing:
         "pdf","docx","txt","md","html","htm",
         "mp3","wav","m4a","mp4","mov","avi","mkv"
     ], accept_multiple_files=True)
-    url = st.text_input("Optional: Source URL (YouTube, web page, etc.)", placeholder="https://…")
+    url_generic = st.text_input("Optional: Generic source URL (web page, etc.)", placeholder="https://…")
     title_hint = st.text_input("Optional: Title override (if empty, filename or URL is used)")
 
-    if st.button("Ingest sources"):
-        added = []
-        errors = []
+    st.markdown("#### Fetch from YouTube/Vimeo")
+    video_url = st.text_input("Video URL", placeholder="https://www.youtube.com/watch?v=… or https://vimeo.com/…")
+    colf1, colf2 = st.columns([1,2])
+    with colf1:
+        fetch_btn = st.button("Fetch & Transcribe")
+    with colf2:
+        st.caption("Uses yt-dlp to download best audio and Whisper to transcribe (requires `yt-dlp`, `ffmpeg`, and an API key or local Whisper).")
 
+    added = []
+    errors = []
+
+    if st.button("Ingest uploaded sources"):
         # Handle file uploads
         if up_files:
             for uf in up_files:
@@ -629,7 +728,6 @@ with tab_ing:
                         "type": Path(uf.name).suffix.lower().lstrip("."),
                     }
                     # Normalize to text
-                    text_out = ""
                     if raw_path.suffix.lower() in [".mp3",".wav",".m4a",".mp4",".mov",".avi",".mkv"]:
                         text_out = transcribe_bytes(uf.getbuffer(), uf.name)
                     else:
@@ -645,14 +743,14 @@ with tab_ing:
                 except Exception as e:
                     errors.append(f"{uf.name}: {e}")
 
-        # Handle simple URL capture (store URL meta; actual fetching left to external job if needed)
-        if url.strip():
+        # Handle simple URL capture (store URL meta; fetching left to pipeline)
+        if url_generic.strip():
             try:
-                slug = _safe_slug(url)
+                slug = _safe_slug(url_generic)
                 meta = {
-                    "title": title_hint or url,
+                    "title": title_hint or url_generic,
                     "source": "url",
-                    "url": url,
+                    "url": url_generic,
                     "ingested_at": _now_iso(),
                     "note": "Stored URL reference; fetch/transcribe externally or paste content as .txt for now."
                 }
@@ -667,7 +765,7 @@ with tab_ing:
         if errors:
             st.error("Some items failed:\n" + "\n".join(errors))
 
-        # Rebuild index
+        # Rebuild index if anything added
         if added:
             if build_index_main:
                 with st.spinner("Rebuilding index…"):
@@ -705,3 +803,70 @@ with tab_ing:
                 st.toast("Index reloaded.", icon="✅")
             except Exception as e:
                 st.warning(f"Reload failed (you may need to rerun): {e}")
+
+    # Fetch & transcribe flow
+    if fetch_btn and video_url.strip():
+        try:
+            slug_hint = _safe_slug(video_url)
+            info = ytdlp_fetch_audio(video_url, RAW_DIR)
+            raw_audio_path = info["path"]
+            title = info["title"]
+            # Transcribe
+            text_out = transcribe_bytes(raw_audio_path.read_bytes(), raw_audio_path.name)
+
+            proc_name = f"{_safe_slug(title)}.txt"
+            proc_path = PROC_DIR / proc_name
+            proc_path.write_text(text_out, encoding="utf-8")
+
+            meta = {
+                "title": title_hint or title,
+                "source": "youtube_vimeo",
+                "url": video_url,
+                "stored_at": str(raw_audio_path),
+                "normalized_text": str(proc_path),
+                "uploader": info.get("uploader"),
+                "upload_date": info.get("upload_date"),
+                "ingested_at": _now_iso(),
+                "type": "audio",
+            }
+            (META_DIR / f"{_safe_slug(title)}.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            st.success(f"Fetched & transcribed: {title}")
+
+            # Rebuild index
+            if build_index_main:
+                with st.spinner("Rebuilding index…"):
+                    try:
+                        build_index_main()
+                        st.success("Index rebuilt.")
+                    except Exception as e:
+                        st.error(f"Index rebuild failed: {e}")
+            else:
+                st.info("Index builder not found. Ensure build_index.py exposes `main()`.")
+
+            # Git sync
+            try:
+                repo = git.Repo(".", search_parent_directories=True) if git else None
+                if repo:
+                    repo.index.add([str(RAW_DIR), str(PROC_DIR), str(META_DIR), "index.faiss", "meta.json", "chunks.json"])
+                    repo.index.commit(f"Ingest via app: fetched {title}")
+                    if repo.remotes:
+                        origin = repo.remotes.origin
+                        origin.push()
+                        st.success("Changes pushed to remote.")
+                    else:
+                        st.info("No git remote configured. Commit saved locally.")
+                else:
+                    st.info("GitPython not installed or not a git repo. Skipped commit/push.")
+            except Exception as e:
+                st.warning(f"Git sync skipped/failed: {e}")
+
+            # Reload index
+            try:
+                index, metas, chunks = load_index()
+                df = load_df()
+                st.toast("Index reloaded.", icon="✅")
+            except Exception as e:
+                st.warning(f"Reload failed (you may need to rerun): {e}")
+
+        except Exception as e:
+            st.error(f"Fetch/transcribe failed: {e}")
