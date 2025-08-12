@@ -10,3 +10,9 @@ readability-lxml
 beautifulsoup4
 pdfplumber
 python-docx
+openai
+yt-dlp
+gitpython
+pdfminer.six
+docx2txt
+beautifulsoup4
