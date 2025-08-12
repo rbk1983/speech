@@ -1,42 +1,31 @@
-# app_llm.py — Precision Mode revamp: newest-first default, no theme filter, all results,
-# but with high-precision speech-level ranking, strictness, exact-phrase/exclusions, core-topic-only,
-# MMR diversification, and optional LLM reranker.
+# app_llm.py — Results layout + Sticky top bar + Robust newest-first
 import os, datetime as _dt, hashlib
 import pandas as pd
 import streamlit as st
 import plotly.express as px
 
-# --- Import utilities with safe fallback for `llm_stream` ---
+# --- Utilities with safe fallback for `llm_stream` ---
 from rag_utils import (
     load_df, load_index,
     retrieve_speeches, sources_from_speeches,
     format_hits_for_context, llm
 )
 
-# Some deployments don't expose `llm_stream`. Provide a graceful fallback so the app doesn't crash.
 try:
     from rag_utils import llm_stream  # type: ignore
 except Exception:
     def llm_stream(system_prompt, user_prompt, *, model="gpt-4o-mini",
                    max_tokens=700, temperature=0.3):
-        """Fallback streaming shim: call `llm` once and yield the full text.
-        Returns (generator, used_model) to match the expected signature.
-        """
         text = llm(system_prompt, user_prompt,
                    model=model, max_tokens=max_tokens, temperature=temperature)
-
         def _gen():
             yield text
-
         return _gen(), model
 
 _LLM_CACHE = {}
 
 def llm_cached(key, system_prompt, user_prompt, *, model="gpt-4o-mini",
                max_tokens=700, temperature=0.3, stream=False):
-    """Cache around llm helpers. When `stream=True`, content streams in real time.
-    Works whether `llm_stream` exists in rag_utils or not.
-    """
     if key in _LLM_CACHE:
         text, used_model = _LLM_CACHE[key]
         if stream:
@@ -47,7 +36,6 @@ def llm_cached(key, system_prompt, user_prompt, *, model="gpt-4o-mini",
         gen, used_model = llm_stream(system_prompt, user_prompt,
                                      model=model, max_tokens=max_tokens,
                                      temperature=temperature)
-        # Streamlit 1.32+: write_stream consumes a generator and returns the full text
         text = st.write_stream(gen)
         out = (text, used_model)
     else:
@@ -56,12 +44,10 @@ def llm_cached(key, system_prompt, user_prompt, *, model="gpt-4o-mini",
                        max_tokens=max_tokens, temperature=temperature)
             out = (text, model)
         except Exception:
-            # Fallback model if the preferred fails
             fallback = "gpt-4o-mini"
             text = llm(system_prompt, user_prompt, model=fallback,
                        max_tokens=max_tokens, temperature=temperature)
             out = (text, fallback)
-
     _LLM_CACHE[key] = out
     return out
 
@@ -75,18 +61,39 @@ except Exception:
     _HAS_P3 = False
 
 st.set_page_config(page_title="Kristalina Speech Intelligence (LLM)", layout="wide")
+
+# ---------------- Styling (Sticky top bar) ----------------
+st.markdown("""
+<style>
+.sticky-bar{
+  position: sticky; top: 0; z-index: 999;
+  padding: .5rem .25rem .6rem .25rem;
+  background: white;
+  border-bottom: 1px solid rgba(0,0,0,.08);
+}
+.source-box pre, .source-box code { white-space: pre-wrap; }
+.card{
+  border: 1px solid rgba(0,0,0,.08);
+  padding: .75rem 1rem; border-radius: 12px; margin-bottom: .75rem;
+  background: #ffffff;
+  box-shadow: 0 1px 4px rgba(0,0,0,.04);
+}
+.card h4{ margin: 0 0 .25rem 0; }
+</style>
+""", unsafe_allow_html=True)
+
 st.title("Kristalina Georgieva — Speech Intelligence")
 
-# ---------------- Ensure index exists ----------------
+# ---------------- Robust loaders with clearer errors ----------------
 def _index_files_present():
     return all(os.path.exists(p) for p in ["index.faiss", "meta.json", "chunks.json"])
 
 def _ensure_index():
     if _index_files_present():
         return True
-    st.warning("Search index not found. Build it once in this app.")
+    st.warning("Search index not found. You can build it here once.")
     if not os.getenv("OPENAI_API_KEY"):
-        st.error("Set OPENAI_API_KEY in Streamlit Secrets and redeploy."); st.stop()
+        st.error("Missing OpenAI API key. Add it to Streamlit secrets, then rerun."); st.stop()
     if st.button("Build index now"):
         with st.spinner("Building index…"):
             try:
@@ -94,59 +101,105 @@ def _ensure_index():
                 build_index_main()
                 st.success("Index built. Click **Rerun** or refresh."); st.stop()
             except Exception as e:
-                st.error(f"Error: {e}")
+                st.error(f"Index build failed: {e}")
+                st.stop()
 
-# Load data and index
 _ensure_index()
-df = load_df()
-index, metas, chunks = load_index()
 
-# Query input
-query = st.text_input("Search speeches", "")
+try:
+    df = load_df()
+except Exception as e:
+    st.error(f"Failed to load metadata dataframe: {e}")
+    st.stop()
 
-# Retrieval controls
+try:
+    index, metas, chunks = load_index()
+except Exception as e:
+    st.error(f"Failed to load search index: {e}")
+    st.stop()
+
+# ---------------- Sticky Top Bar: query + dates + key switches ----------------
+with st.container():
+    st.markdown('<div class="sticky-bar">', unsafe_allow_html=True)
+    top_c1, top_c2, top_c3, top_c4 = st.columns([2, 2, 1.5, 1.5])
+    with top_c1:
+        query = st.text_input("Search speeches", "", placeholder="e.g., climate finance, inflation, Ukraine")
+    with top_c2:
+        # Date range
+        try:
+            min_date = pd.to_datetime(df["date"], errors="coerce").dropna().min().date()
+            max_date = pd.to_datetime(df["date"], errors="coerce").dropna().max().date()
+        except Exception:
+            min_date = _dt.date(2000,1,1)
+            max_date = _dt.date.today()
+        date_from = st.date_input("From", min_date, key="from")
+        date_to = st.date_input("To", max_date, key="to")
+    with top_c3:
+        sort = st.selectbox("Sort", ["Newest", "Relevance"], index=0)
+        layout_mode = st.selectbox("Layout", ["Dense list", "Compact cards"], index=1)
+    with top_c4:
+        exact_phrase = st.toggle("Exact phrase", value=True)
+        precision_mode = st.toggle("High precision", value=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+# Other controls (non-sticky)
 c1, c2, c3 = st.columns(3)
 with c1:
-    sort = st.selectbox("Sort", ["Newest", "Relevance"], index=0)
-    precision_mode = st.toggle("High precision ranking", value=True)
     strictness = st.slider("Strictness", 0.0, 1.0, 0.6, 0.05)
 with c2:
-    exact_phrase = st.toggle("Exact phrase", value=True)
     exclude_terms = st.text_input("Exclude terms (comma-separated)", "")
     core_topic_only = st.toggle("Core topic only", value=False)
 with c3:
-    min_date = df["date"].min().date()
-    max_date = df["date"].max().date()
-    date_from = st.date_input("Date from", min_date)
-    date_to = st.date_input("Date to", max_date)
+    view_mode = st.selectbox("View mode", ["Depth", "Breadth"], index=0)
+    ctx_limit = st.slider("Context items per section", 6, 20, 12)
+    model_preferred = st.selectbox("Model", ["gpt-4o-mini", "gpt-4o"], index=0)
+    per_item_tokens = st.slider("Tokens per item", 200, 1000, 400, step=50)
+
 filters = {"date_from": date_from, "date_to": date_to}
-
-view_mode = st.selectbox("View mode", ["Depth", "Breadth"], index=0)
-ctx_limit = st.slider("Context items per section", 6, 20, 12)
-model_preferred = st.selectbox("Model", ["gpt-4o-mini", "gpt-4o"], index=0)
-per_item_tokens = st.slider("Tokens per item", 200, 1000, 400, step=50)
-
 sort_key = "newest" if sort == "Newest" else "relevance"
+
+def _parse_date(meta_date):
+    # robust ISO parsing
+    try:
+        return pd.to_datetime(str(meta_date), errors="coerce")
+    except Exception:
+        return pd.NaT
+
+def _enforce_newest_first(items):
+    # Sort client-side by meta['date'] DESC to fix any backend inconsistencies
+    return sorted(items, key=lambda sp: _parse_date(sp["meta"].get("date")), reverse=True)
 
 speeches, total_before = [], 0
 display_list = []
+
 if query and query.strip():
-    speeches, total_before = retrieve_speeches(
-        query=query,
-        index=index, metas=metas, chunks=chunks,
-        filters=filters,
-        sort=sort_key,
-        precision=precision_mode,
-        strictness=strictness,
-        exact_phrase=exact_phrase,
-        exclude_terms=[t.strip() for t in exclude_terms.split(",") if t.strip()],
-        core_topic_only=core_topic_only,
-        use_llm_rerank=True,
-        model=model_preferred
-    )
-    st.caption(f"Precision results: {len(speeches)} speeches (from {total_before} initial candidates).")
-    show_all = st.toggle("Show all matched speeches", value=False)
-    display_list = speeches if show_all else speeches[:15]
+    try:
+        speeches, total_before = retrieve_speeches(
+            query=query,
+            index=index, metas=metas, chunks=chunks,
+            filters=filters,
+            sort=sort_key,
+            precision=precision_mode,
+            strictness=strictness,
+            exact_phrase=exact_phrase,
+            exclude_terms=[t.strip() for t in exclude_terms.split(",") if t.strip()],
+            core_topic_only=core_topic_only,
+            use_llm_rerank=True,
+            model=model_preferred
+        )
+    except Exception as e:
+        st.error(f"Search failed: {e}")
+        speeches = []
+
+    if speeches:
+        # Explicit newest-first fix
+        if sort_key == "newest":
+            speeches = _enforce_newest_first(speeches)
+        st.caption(f"Precision results: {len(speeches)} speeches (from {total_before} initial candidates).")
+        show_all = st.toggle("Show all matched speeches", value=False)
+        display_list = speeches if show_all else speeches[:15]
+    else:
+        st.info("No results. Try loosening strictness or widening the date range.")
 else:
     st.info("Enter a search term above to explore speeches.")
 
@@ -156,7 +209,6 @@ if _HAS_P3:
     tabs.insert(3, "Trajectory")
 tab_objs = st.tabs(tabs)
 
-# Map tabs
 tab_res  = tab_objs[0]
 tab_comp = tab_objs[1]
 tab_brief = tab_objs[2]
@@ -168,34 +220,62 @@ else:
     tab_rr   = tab_objs[3]
     tab_draft = tab_objs[4]
 
-# Helper to convert speeches list into hits_for_llm (idx,m,ch)
 def _to_hits(items):
     return [(sp["best_idx"], sp["meta"], sp["best_chunk"]) for sp in items]
 
-# ---------------- Results tab ----------------
+# ---------------- Results tab (with layout choices + source utilities) ----------------
 with tab_res:
     if not speeches:
-        st.info("Enter a search above to see results.")
+        st.info("Enter a search to see results. Tip: toggling **Exact phrase** often boosts precision.")
     else:
         st.subheader("Most Recent" if sort_key == "newest" else "Most Relevant")
+
+        # Render
         for sp in display_list:
             m = sp["meta"]; ch = sp["best_chunk"]
-            st.markdown(f"**{m.get('date')} — [{m.get('title')}]({m.get('link')})**")
+            date_s = str(m.get('date'))
+            title = m.get('title')
+            link = m.get('link')
+            header_md = f"**{date_s} — [{title}]({link})**"
+
             sys = "You are an IMF speech analyst. Produce a concise snippet and 3–5 bullets grounded only in the excerpt."
             usr = f"Excerpt:\n{ch}\n\nReturn a 1–2 sentence snippet, then 3–5 bullets of key points."
-            key = f"res::{m.get('date')}::{m.get('title')}::{model_preferred}"
-            (md, used_model) = llm_cached(key, sys, usr, model=model_preferred,
-                                         max_tokens=per_item_tokens, temperature=0.2,
-                                         stream=True)
-            st.caption(f"Model: {used_model}")
-        with st.expander("Show sources used on this page"):
-            for (d, t, l) in sources_from_speeches(display_list):
-                st.markdown(f"- {d} — [{t}]({l})")
+            key = f"res::{date_s}::{title}::{model_preferred}"
+            if layout_mode == "Compact cards":
+                st.markdown(f'<div class="card"><h4>{date_s} — <a href="{link}">{title}</a></h4>', unsafe_allow_html=True)
+                (md, used_model) = llm_cached(key, sys, usr, model=model_preferred,
+                                              max_tokens=per_item_tokens, temperature=0.2,
+                                              stream=True)
+                st.caption(f"Model: {used_model}")
+                st.markdown("</div>", unsafe_allow_html=True)
+            else:
+                st.markdown(header_md)
+                (md, used_model) = llm_cached(key, sys, usr, model=model_preferred,
+                                              max_tokens=per_item_tokens, temperature=0.2,
+                                              stream=True)
+                st.caption(f"Model: {used_model}")
 
-# ---------------- Thematic Evolution (date range) ----------------
+        # Sources utility
+        with st.expander("Sources used on this page"):
+            page_sources = list(sources_from_speeches(display_list))
+            if not page_sources:
+                st.info("No sources to show.")
+            else:
+                # Show as bullets
+                for (d, t, l) in page_sources:
+                    st.markdown(f"- {d} — [{t}]({l})")
+                # One-click copy: present a textarea (copy icon built-in) + download
+                lines = [f"{d} — {t} — {l}" for (d,t,l) in page_sources]
+                all_sources_text = "\n".join(lines)
+                st.markdown("**Copy all sources:**")
+                st.text_area("All sources (copy)", all_sources_text, height=120, label_visibility="collapsed")
+                st.download_button("Download sources (.txt)", all_sources_text.encode("utf-8"),
+                                   file_name="sources.txt", mime="text/plain")
+
+# ---------------- Thematic Evolution (unchanged core, better empty states) ----------------
 with tab_comp:
     if not speeches:
-        st.info("Enter a search above to analyze thematic evolution.")
+        st.info("Enter a search to analyze thematic evolution.")
     else:
         st.subheader("Thematic Evolution (LLM) — Date Range")
         st.caption(f"Analyzing: **{filters['date_from'].isoformat()} → {filters['date_to'].isoformat()}**")
@@ -213,13 +293,11 @@ with tab_comp:
         if not range_items:
             st.warning("No matching content in this date range. Try broadening the range.")
         else:
-            # group by year
             by_year = {}
             for sp in range_items:
                 m = sp["meta"]
                 y = int(m.get("year", 0) or str(m.get("date",""))[:4] or 0)
-                if y == 0:
-                    continue
+                if y == 0: continue
                 by_year.setdefault(y, []).append(sp)
             years_asc = sorted(by_year.keys())
             year_span = filters['date_to'].year - filters['date_from'].year
@@ -296,47 +374,6 @@ Task: Write a short 'Messaging Evolution' narrative for the whole range (6–10 
                 for (d, t, l) in sources_from_speeches(range_items):
                     st.markdown(f"- {d} — [{t}]({l})")
 
-# ---------------- Briefing Pack tab ----------------
-with tab_brief:
-    st.subheader("Briefing Pack (LLM)")
-    brief_query = st.text_input("Search topic for briefing", "")
-    if st.button("Generate briefing") and brief_query.strip():
-        brief_speeches, _ = retrieve_speeches(
-            query=brief_query,
-            index=index, metas=metas, chunks=chunks,
-            filters=filters,
-            sort="relevance",
-            precision=precision_mode,
-            strictness=strictness,
-            exact_phrase=exact_phrase,
-            exclude_terms=[],
-            core_topic_only=False,
-            use_llm_rerank=True,
-            model=model_preferred,
-        )
-        brief_hits = _to_hits(brief_speeches[: (36 if view_mode == "Depth" else 20)])
-        ctx_brief = format_hits_for_context(brief_hits, limit=(ctx_limit+4))
-        sys_b = "You are drafting a media-ready briefing grounded ONLY in provided context."
-        usr_b = f"""Topic: {brief_query}
-
-Context:
-{ctx_brief}
-
-Tasks:
-- Executive summary (3–5 bullets).
-- Five key issues (1–2 sentence summaries each; no quotes).
-- Five strongest quotes (with Month YYYY — Title).
-- Short timeline bullets (Month YYYY — Title).
-Return clean Markdown."""
-        key = f"brief::{brief_query}::{filters['date_from']}::{filters['date_to']}::{model_preferred}"
-        (brief_md, used_model4) = llm_cached(key, sys_b, usr_b, model=model_preferred,
-                                             max_tokens=per_item_tokens+200, temperature=0.25,
-                                             stream=True)
-        st.caption(f"Model: {used_model4}")
-        st.download_button("Download briefing (Markdown)", brief_md.encode("utf-8"), file_name="briefing.md", mime="text/markdown")
-    else:
-        st.info("Enter a topic and click Generate briefing.")
-
 # ---------------- Optional Trajectory tab ----------------
 if _HAS_P3:
     with tab_traj:
@@ -345,7 +382,7 @@ if _HAS_P3:
         else:
             st.subheader("Messaging Trajectory")
             ctx = format_hits_for_context(_to_hits(display_list), limit=(ctx_limit+4))
-            series = build_issue_trajectory(query, ctx, model_preferred)  # returns DataFrame columns: year, issue, share
+            series = build_issue_trajectory(query, ctx, model_preferred)  # DataFrame: year, issue, share
             if not series.empty:
                 fig = px.area(series, x="year", y="share", color="issue", groupnorm="fraction")
                 st.plotly_chart(fig, use_container_width=True)
@@ -364,19 +401,24 @@ with tab_rr:
     st.subheader("Rapid Response")
     inquiry = st.text_area("Media inquiry from journalist", "")
     if st.button("Generate response") and inquiry.strip():
-        rr_speeches, _ = retrieve_speeches(
-            query=inquiry,
-            index=index, metas=metas, chunks=chunks,
-            filters=filters,
-            sort="relevance",
-            precision=precision_mode,
-            strictness=strictness,
-            exact_phrase=True,
-            exclude_terms=[],
-            core_topic_only=False,
-            use_llm_rerank=True,
-            model=model_preferred
-        )
+        try:
+            rr_speeches, _ = retrieve_speeches(
+                query=inquiry,
+                index=index, metas=metas, chunks=chunks,
+                filters=filters,
+                sort="relevance",
+                precision=precision_mode,
+                strictness=strictness,
+                exact_phrase=True,
+                exclude_terms=[],
+                core_topic_only=False,
+                use_llm_rerank=True,
+                model=model_preferred
+            )
+        except Exception as e:
+            st.error(f"Search failed: {e}")
+            rr_speeches = []
+
         rr_hits = _to_hits(rr_speeches[: (36 if view_mode == "Depth" else 20)])
         ctx_rr = format_hits_for_context(rr_hits, limit=(ctx_limit+6))
         if ctx_rr.strip():
@@ -402,6 +444,8 @@ Tasks:
                     st.markdown(f"- {d} — [{t}]({l})")
         else:
             st.warning("No relevant context found to answer the inquiry.")
+    else:
+        st.info("Paste the inquiry and click Generate response.")
 
 # ---------------- Draft Assist tab ----------------
 with tab_draft:
@@ -415,31 +459,32 @@ with tab_draft:
     style = r2c2.text_input("Style", "")
 
     if st.button("Draft outline") and big_ideas.strip():
-        draft_speeches, _ = retrieve_speeches(
-            query=big_ideas,
-            index=index, metas=metas, chunks=chunks,
-            filters=filters,
-            sort=sort_key,
-            precision=precision_mode,
-            strictness=strictness,
-            exact_phrase=False,
-            exclude_terms=[],
-            core_topic_only=False,
-            use_llm_rerank=True,
-            model=model_preferred,
-        )
+        try:
+            draft_speeches, _ = retrieve_speeches(
+                query=big_ideas,
+                index=index, metas=metas, chunks=chunks,
+                filters=filters,
+                sort=sort_key,
+                precision=precision_mode,
+                strictness=strictness,
+                exact_phrase=False,
+                exclude_terms=[],
+                core_topic_only=False,
+                use_llm_rerank=True,
+                model=model_preferred,
+            )
+        except Exception as e:
+            st.error(f"Search failed: {e}")
+            draft_speeches = []
+
         draft_hits = _to_hits(draft_speeches[: (36 if view_mode == "Depth" else 20)])
         ctx = format_hits_for_context(draft_hits, limit=(ctx_limit+6))
 
         params = []
-        if audience.strip():
-            params.append(f"Audience: {audience}")
-        if venue.strip():
-            params.append(f"Venue: {venue}")
-        if tone.strip():
-            params.append(f"Tone: {tone}")
-        if style.strip():
-            params.append(f"Style: {style}")
+        if audience.strip(): params.append(f"Audience: {audience}")
+        if venue.strip(): params.append(f"Venue: {venue}")
+        if tone.strip(): params.append(f"Tone: {tone}")
+        if style.strip(): params.append(f"Style: {style}")
         params.append(f"Big ideas: {big_ideas}")
         param_block = "\n".join(params)
 
