@@ -12,24 +12,9 @@ from rag_utils import (
     format_hits_for_context, llm
 )
 
-# Optional Phase 2/3 imports (soft)
-try:
-    from phase2_utils import (
-        load_playbook, load_stakeholders,
-        alignment_radar_data, alignment_narrative,
-        rapid_response_pack,
-        tone_time_series, tone_heatmap_data,
-        stakeholder_scores, stakeholder_narrative
-    )
-    _HAS_P2 = True
-except Exception:
-    _HAS_P2 = False
-
 # Optional Phase 3 imports (soft)
 try:
     from phase3_utils import (
-        build_issue_trajectory, forecast_issue_trends, trajectory_narrative,
-        numeric_alignment_score
         build_issue_trajectory, forecast_issue_trends, trajectory_narrative
     )
     _HAS_P3 = True
@@ -82,38 +67,20 @@ show_all = st.toggle("Show all matched speeches", value=False)
 display_list = speeches if show_all else speeches[:15]
 
 # ---------------- Tabs ----------------
-tabs = ["Results", "Thematic Evolution", "Top Quotes", "Briefing Pack", "Analytics", "Alignment", "Rapid Response", "Tone", "Draft Assist", "Stakeholders"]
 tabs = ["Results", "Thematic Evolution", "Briefing Pack", "Rapid Response", "Draft Assist"]
 if _HAS_P3:
-    tabs.insert(5, "Trajectory")
     tabs.insert(3, "Trajectory")
 tab_objs = st.tabs(tabs)
 
 # Map tabs
-tab_res   = tab_objs[0]
-tab_comp  = tab_objs[1]
-tab_quote = tab_objs[2]
-tab_brief = tab_objs[3]
-tab_viz   = tab_objs[4]
 tab_res  = tab_objs[0]
 tab_comp = tab_objs[1]
 tab_brief = tab_objs[2]
 if _HAS_P3:
-    tab_traj = tab_objs[5]
-    tab_align = tab_objs[6]
-    tab_rr    = tab_objs[7]
-    tab_tone  = tab_objs[8]
-    tab_draft = tab_objs[9]
-    tab_stake = tab_objs[10]
     tab_traj = tab_objs[3]
     tab_rr  = tab_objs[4]
     tab_draft = tab_objs[5]
 else:
-    tab_align = tab_objs[5]
-    tab_rr    = tab_objs[6]
-    tab_tone  = tab_objs[7]
-    tab_draft = tab_objs[8]
-    tab_stake = tab_objs[9]
     tab_rr   = tab_objs[3]
     tab_draft = tab_objs[4]
 
@@ -162,25 +129,10 @@ with tab_comp:
         for sp in range_items:
             m = sp["meta"]
             y = int(m.get("year", 0) or str(m.get("date",""))[:4] or 0)
-            if y == 0: continue
             if y == 0:
                 continue
             by_year.setdefault(y, []).append(sp)
         years_asc = sorted(by_year.keys())
-
-        per_year_limit = max(3, min(6, (12 if view_mode=="Depth" else 8) // max(1, len(years_asc))))
-        year_sections = []
-        for y in years_asc:
-            hits = _to_hits(by_year[y])[:per_year_limit]
-            ctx = format_hits_for_context(hits, limit=per_year_limit, char_limit=900)
-            if ctx.strip():
-                year_sections.append(f"=== Year {y} ===\n{ctx}")
-        full_ctx = "\n\n".join(year_sections) if year_sections else "(no matching context)"
-
-        sys1 = ("You are a senior IMF communications strategist. Using ONLY the provided context, "
-                "produce issue-focused yearly summaries. Focus on substance; avoid speculation. "
-                "Add (Month YYYY — Title) from headers when referencing specifics.")
-        usr1 = f"""
         year_span = filters['date_to'].year - filters['date_from'].year
 
         ctx_for_evol = ""
@@ -207,10 +159,6 @@ Context grouped by year (each item starts with [YYYY-MM-DD — Title](link)):
 
 Task: For each year in the range, list 3–5 ISSUE headings with 1–2 sentence summaries (no quotes). Keep it concise.
 """
-        (per_year_md, used_model1) = llm_cached(f"peryear::{query}::{filters['date_from']}::{filters['date_to']}::{model_preferred}", sys1, usr1, model=model_preferred, max_tokens=per_item_tokens, temperature=0.2)
-        st.markdown("### Per-Year Focus")
-        st.markdown(per_year_md)
-        st.caption(f"Model: {used_model1}")
             (focus_md, used_model1) = llm_cached(
                 f"peryear::{query}::{filters['date_from']}::{filters['date_to']}::{model_preferred}",
                 sys1, usr1, model=model_preferred, max_tokens=per_item_tokens, temperature=0.2)
@@ -249,13 +197,11 @@ Task: List 3–5 ISSUE headings with 1–2 sentence summaries (no quotes).
 Topic: {query}
 Range: {filters['date_from'].isoformat()} → {filters['date_to'].isoformat()}
 
-Use the same context as above.
 Context:
 {ctx_for_evol}
 
 Task: Write a short 'Messaging Evolution' narrative for the whole range (6–10 sentences, crisp).
 """
-        (evol_md, used_model2) = llm_cached(f"evol::{query}::{filters['date_from']}::{filters['date_to']}::{model_preferred}", sys2, usr2, model=model_preferred, max_tokens=per_item_tokens, temperature=0.2)
         (evol_md, used_model2) = llm_cached(
             f"evol::{query}::{filters['date_from']}::{filters['date_to']}::{model_preferred}",
             sys2, usr2, model=model_preferred, max_tokens=per_item_tokens, temperature=0.2)
@@ -266,29 +212,6 @@ Task: Write a short 'Messaging Evolution' narrative for the whole range (6–10 
         with st.expander("Show sources (Thematic Evolution)"):
             for (d, t, l) in sources_from_speeches(range_items):
                 st.markdown(f"- {d} — [{t}]({l})")
-
-# ---------------- Top Quotes tab ----------------
-with tab_quote:
-    st.subheader("Top Quotes (LLM)")
-    ctx_quotes = format_hits_for_context(_to_hits(display_list), limit=(ctx_limit+2))
-    sys_q = ("You extract on-topic quotes. Use ONLY provided context; return exact sentences. "
-             "Each bullet ends with (Month YYYY — Title) and includes the link from the header. "
-             "Prioritize quotes that clearly address the user's topic.")
-    usr_q = f"""
-Topic: {query}
-
-Context:
-{ctx_quotes}
-
-Task:
-Return exactly 5 strong on-topic quotes (1–3 sentences each). Each bullet ends with (Month YYYY — Title).
-"""
-    (quotes_md, used_model3) = llm_cached(f"quotes::{query}::{filters['date_from']}::{filters['date_to']}::{model_preferred}", sys_q, usr_q, model=model_preferred, max_tokens=per_item_tokens, temperature=0.2)
-    st.markdown(quotes_md)
-    st.caption(f"Model: {used_model3}")
-    with st.expander("Show sources (Quotes)"):
-        for (d,t,l) in sources_from_speeches(display_list):
-            st.markdown(f"- {d} — [{t}]({l})")
 
 # ---------------- Briefing Pack tab ----------------
 with tab_brief:
@@ -313,35 +236,6 @@ Return clean Markdown.
     st.caption(f"Model: {used_model4}")
     st.download_button("Download briefing (Markdown)", brief_md.encode("utf-8"), file_name="briefing.md", mime="text/markdown")
 
-# ---------------- Analytics tab (visuals) ----------------
-with tab_viz:
-    st.subheader("Analytics & Visuals")
-    viz_rows = []
-    for sp in display_list:
-        m = sp["meta"]
-        viz_rows.append({
-            "date": m.get("date"),
-            "year": int(str(m.get("date"))[:4]) if m.get("date") else None,
-            "title": m.get("title"),
-            "link": m.get("link"),
-        })
-    vdf = pd.DataFrame(viz_rows)
-    if not vdf.empty:
-        vdf["date"] = pd.to_datetime(vdf["date"], errors="coerce")
-        c1, c2 = st.columns(2)
-        with c1:
-            st.caption("Timeline of matching speeches")
-            tl = vdf.sort_values("date")
-            fig = px.scatter(tl, x="date", y=[1]*len(tl), hover_data=["title"], labels={"y":""})
-            fig.update_yaxes(visible=False, showticklabels=False)
-            st.plotly_chart(fig, use_container_width=True)
-        with c2:
-            st.caption("Speeches by year (current result set)")
-            year_ct = vdf.groupby("year")["title"].count().reset_index(name="speeches")
-            fig2 = px.bar(year_ct.sort_values("year"), x="year", y="speeches")
-            st.plotly_chart(fig2, use_container_width=True)
-    else:
-        st.info("No data to chart yet — adjust your query or date range.")
 
 # ---------------- Optional Trajectory tab ----------------
 if _HAS_P3:
@@ -362,48 +256,9 @@ if _HAS_P3:
         else:
             st.info("No trajectory could be derived from current context.")
 
-# ---------------- Alignment tab ----------------
-with tab_align:
-    st.subheader("Message Consistency & Alignment")
-    if _HAS_P2:
-        playbook = load_playbook()
-        ctx = format_hits_for_context(_to_hits(display_list), limit=(ctx_limit+2))
-        if _HAS_P3:
-            try:
-                score = numeric_alignment_score(query, playbook, ctx, model_preferred)  # 0..100
-                st.metric("Alignment Score", f"{int(score)} / 100")
-            except Exception:
-                pass
-        radar_df = alignment_radar_data(query, playbook, ctx, model_preferred)
-        if radar_df is not None and not radar_df.empty and len(radar_df) >= 3:
-            fig = px.line_polar(radar_df, r="score", theta="issue", line_close=True)
-            fig.update_traces(fill='toself')
-            st.plotly_chart(fig, use_container_width=True)
-        elif radar_df is not None and not radar_df.empty:
-            st.caption("Not enough distinct issues for a radar. Showing bars instead.")
-            figb = px.bar(radar_df.sort_values("score", ascending=False), x="issue", y="score")
-            st.plotly_chart(figb, use_container_width=True)
-        else:
-            st.info("No issues detected. Try broadening the range or query.")
-        nar = alignment_narrative(query, playbook, ctx, model_preferred)
-        st.markdown(nar)
-    else:
-        st.info("Playbook features are not available (phase2_utils not found).")
-
 # ---------------- Rapid Response tab ----------------
 with tab_rr:
     st.subheader("Rapid Response")
-    colh1, colh2 = st.columns(2)
-    headline = colh1.text_input("Paste headline or topic", "")
-    url_hint = colh2.text_input("Optional: related URL (for context note only)", "")
-    if st.button("Generate Press Lines"):
-        ctx = format_hits_for_context(_to_hits(display_list), limit=(ctx_limit+4))
-        if _HAS_P2:
-            pack_md = rapid_response_pack(headline or query, ctx, model_preferred, url_hint=url_hint)
-            st.markdown(pack_md)
-            st.download_button("Download rapid-response (Markdown)", pack_md.encode("utf-8"), file_name="rapid_response.md", mime="text/markdown")
-        else:
-            st.info("Rapid response generator requires phase2_utils.")
     inquiry = st.text_area("Media inquiry from journalist", "")
     if st.button("Generate response") and inquiry.strip():
         rr_speeches, _ = retrieve_speeches(
@@ -429,22 +284,6 @@ with tab_rr:
             )
             usr = f"""Inquiry: {inquiry}
 
-# ---------------- Tone tab ----------------
-with tab_tone:
-    st.subheader("Sentiment & Tone")
-    if _HAS_P2:
-        ctx = format_hits_for_context(_to_hits(display_list), limit=(ctx_limit+6))
-        ts = tone_time_series(query, ctx, model_preferred)
-        if not ts.empty:
-            fig = px.line(ts, x="date", y="score", color="tone", markers=True)
-            st.plotly_chart(fig, use_container_width=True)
-        hm = tone_heatmap_data(query, ctx, model_preferred)
-        if not hm.empty:
-            fig2 = px.imshow(hm.pivot_table(index="tone", columns="year", values="score", fill_value=0),
-                             aspect="auto", color_continuous_scale="Blues")
-            st.plotly_chart(fig2, use_container_width=True)
-    else:
-        st.info("Tone features require phase2_utils.")
 Context:
 {ctx_rr}
 
@@ -497,20 +336,3 @@ Return clean Markdown.
         st.markdown(md)
         st.caption(f"Model: {used_model}")
         st.download_button("Download draft (Markdown)", md.encode("utf-8"), file_name="speech_draft.md", mime="text/markdown")
-
-# ---------------- Stakeholders tab ----------------
-with tab_stake:
-    st.subheader("Stakeholder Relevance")
-    if _HAS_P2:
-        stakeholders = load_stakeholders()
-        ctx = format_hits_for_context(_to_hits(display_list), limit=(ctx_limit+4))
-        scores = stakeholder_scores(query, stakeholders, ctx, model_preferred)  # returns DataFrame
-        if not scores.empty:
-            fig = px.bar(scores, x="stakeholder", y="score")
-            st.plotly_chart(fig, use_container_width=True)
-            nar = stakeholder_narrative(query, stakeholders, ctx, model_preferred)
-            st.markdown(nar)
-        else:
-            st.info("No clear stakeholder mapping detected—try a broader query or range.")
-    else:
-        st.info("Stakeholder features require phase2_utils.")
