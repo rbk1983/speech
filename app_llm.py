@@ -1,5 +1,5 @@
-# app_llm.py — Results layout + Sticky top bar + Robust newest-first
-import os, datetime as _dt, hashlib
+# app_llm.py — Simplified UI, real newest-first, pagination
+import os, datetime as _dt, hashlib, math
 import pandas as pd
 import streamlit as st
 import plotly.express as px
@@ -22,16 +22,18 @@ except Exception:
             yield text
         return _gen(), model
 
-_LLM_CACHE = {}
+# ----- Defaults (kept simple) -----
+PER_ITEM_TOKENS = 400   # Longer = richer bullets/snippets (more cost); Shorter = terser (cheaper)
+DEFAULT_MODEL   = "gpt-4o-mini"
 
-def llm_cached(key, system_prompt, user_prompt, *, model="gpt-4o-mini",
-               max_tokens=700, temperature=0.3, stream=False):
+_LLM_CACHE = {}
+def llm_cached(key, system_prompt, user_prompt, *, model=DEFAULT_MODEL,
+               max_tokens=PER_ITEM_TOKENS, temperature=0.3, stream=False):
     if key in _LLM_CACHE:
         text, used_model = _LLM_CACHE[key]
         if stream:
             st.markdown(text)
         return text, used_model
-
     if stream:
         gen, used_model = llm_stream(system_prompt, user_prompt,
                                      model=model, max_tokens=max_tokens,
@@ -44,7 +46,7 @@ def llm_cached(key, system_prompt, user_prompt, *, model="gpt-4o-mini",
                        max_tokens=max_tokens, temperature=temperature)
             out = (text, model)
         except Exception:
-            fallback = "gpt-4o-mini"
+            fallback = DEFAULT_MODEL
             text = llm(system_prompt, user_prompt, model=fallback,
                        max_tokens=max_tokens, temperature=temperature)
             out = (text, fallback)
@@ -71,7 +73,6 @@ st.markdown("""
   background: white;
   border-bottom: 1px solid rgba(0,0,0,.08);
 }
-.source-box pre, .source-box code { white-space: pre-wrap; }
 .card{
   border: 1px solid rgba(0,0,0,.08);
   padding: .75rem 1rem; border-radius: 12px; margin-bottom: .75rem;
@@ -118,10 +119,10 @@ except Exception as e:
     st.error(f"Failed to load search index: {e}")
     st.stop()
 
-# ---------------- Sticky Top Bar: query + dates + key switches ----------------
+# ---------------- Sticky Top Bar ----------------
 with st.container():
     st.markdown('<div class="sticky-bar">', unsafe_allow_html=True)
-    top_c1, top_c2, top_c3, top_c4 = st.columns([2, 2, 1.5, 1.5])
+    top_c1, top_c2, top_c3, top_c4 = st.columns([2.2, 2.2, 1.2, 1.2])
     with top_c1:
         query = st.text_input("Search speeches", "", placeholder="e.g., climate finance, inflation, Ukraine")
     with top_c2:
@@ -138,51 +139,58 @@ with st.container():
         sort = st.selectbox("Sort", ["Newest", "Relevance"], index=0)
         layout_mode = st.selectbox("Layout", ["Dense list", "Compact cards"], index=1)
     with top_c4:
-        exact_phrase = st.toggle("Exact phrase", value=True)
-        precision_mode = st.toggle("High precision", value=True)
+        exact_phrase = st.toggle("Exact phrase", value=True, help="Match the exact phrase; reduces noise for multi-word queries.")
+        high_precision = st.toggle("High precision ranking", value=True, help="Better ranking via dense retrieval + reranking + diversity controls.")
     st.markdown('</div>', unsafe_allow_html=True)
 
-# Other controls (non-sticky)
-c1, c2, c3 = st.columns(3)
-with c1:
-    strictness = st.slider("Strictness", 0.0, 1.0, 0.6, 0.05)
-with c2:
-    exclude_terms = st.text_input("Exclude terms (comma-separated)", "")
-    core_topic_only = st.toggle("Core topic only", value=False)
-with c3:
-    view_mode = st.selectbox("View mode", ["Depth", "Breadth"], index=0)
-    ctx_limit = st.slider("Context items per section", 6, 20, 12)
+# Simplification note: We keep DEPTH as the default philosophy (richer context per item).
+st.caption("Mode: **Depth** — returns fewer items per step but with richer context for better summaries.")
+
+# Advanced (collapsed)
+with st.expander("Advanced settings", expanded=False):
+    strictness = st.slider("Strictness", 0.0, 1.0, 0.6, 0.05,
+                           help="Higher = tighter match to your query; lower = looser, more exploratory.")
+    core_topic_only = st.toggle("Core topic only", value=False,
+                                help="Show speeches where the query is a central theme (not just a passing mention).")
     model_preferred = st.selectbox("Model", ["gpt-4o-mini", "gpt-4o"], index=0)
-    per_item_tokens = st.slider("Tokens per item", 200, 1000, 400, step=50)
 
 filters = {"date_from": date_from, "date_to": date_to}
 sort_key = "newest" if sort == "Newest" else "relevance"
 
 def _parse_date(meta_date):
-    # robust ISO parsing
     try:
         return pd.to_datetime(str(meta_date), errors="coerce")
     except Exception:
         return pd.NaT
 
 def _enforce_newest_first(items):
-    # Sort client-side by meta['date'] DESC to fix any backend inconsistencies
     return sorted(items, key=lambda sp: _parse_date(sp["meta"].get("date")), reverse=True)
 
-speeches, total_before = [], 0
-display_list = []
+# Session state for pagination
+if "page" not in st.session_state:
+    st.session_state.page = 1
 
+def reset_pagination():
+    st.session_state.page = 1
+
+speeches, total_before = [], 0
 if query and query.strip():
+    # Reset pagination when query/filters change (simple heuristic)
+    # Use a fingerprint to detect changes
+    fp = f"{query}|{date_from}|{date_to}|{sort_key}|{exact_phrase}|{high_precision}|{core_topic_only}|{strictness}"
+    if st.session_state.get("fp") != fp:
+        st.session_state.fp = fp
+        reset_pagination()
     try:
         speeches, total_before = retrieve_speeches(
             query=query,
             index=index, metas=metas, chunks=chunks,
             filters=filters,
             sort=sort_key,
-            precision=precision_mode,
+            precision=high_precision,
             strictness=strictness,
             exact_phrase=exact_phrase,
-            exclude_terms=[t.strip() for t in exclude_terms.split(",") if t.strip()],
+            exclude_terms=[],            # removed from UI by request
             core_topic_only=core_topic_only,
             use_llm_rerank=True,
             model=model_preferred
@@ -192,21 +200,23 @@ if query and query.strip():
         speeches = []
 
     if speeches:
-        # Explicit newest-first fix
         if sort_key == "newest":
             speeches = _enforce_newest_first(speeches)
-        st.caption(f"Precision results: {len(speeches)} speeches (from {total_before} initial candidates).")
-        show_all = st.toggle("Show all matched speeches", value=False)
-        display_list = speeches if show_all else speeches[:15]
+
+        st.caption(f"Matched speeches: {len(speeches)} (from {total_before} initial candidates).")
     else:
         st.info("No results. Try loosening strictness or widening the date range.")
+
 else:
     st.info("Enter a search term above to explore speeches.")
 
 # ---------------- Tabs ----------------
 tabs = ["Results", "Thematic Evolution", "Briefing Pack", "Rapid Response", "Draft Assist"]
-if _HAS_P3:
-    tabs.insert(3, "Trajectory")
+try:
+    if _HAS_P3:
+        tabs.insert(3, "Trajectory")
+except Exception:
+    pass
 tab_objs = st.tabs(tabs)
 
 tab_res  = tab_objs[0]
@@ -223,48 +233,68 @@ else:
 def _to_hits(items):
     return [(sp["best_idx"], sp["meta"], sp["best_chunk"]) for sp in items]
 
-# ---------------- Results tab (with layout choices + source utilities) ----------------
+# ---------------- Results with pagination (10 per page) ----------------
 with tab_res:
     if not speeches:
-        st.info("Enter a search to see results. Tip: toggling **Exact phrase** often boosts precision.")
+        st.info("Enter a search to see results.")
     else:
         st.subheader("Most Recent" if sort_key == "newest" else "Most Relevant")
 
-        # Render
-        for sp in display_list:
+        PAGE_SIZE = 10
+        total = len(speeches)
+        total_pages = max(1, math.ceil(total / PAGE_SIZE))
+        page = max(1, min(st.session_state.page, total_pages))
+
+        start = (page - 1) * PAGE_SIZE
+        end = min(start + PAGE_SIZE, total)
+        page_items = speeches[start:end]
+
+        # Render page items
+        for sp in page_items:
             m = sp["meta"]; ch = sp["best_chunk"]
             date_s = str(m.get('date'))
             title = m.get('title')
             link = m.get('link')
-            header_md = f"**{date_s} — [{title}]({link})**"
-
-            sys = "You are an IMF speech analyst. Produce a concise snippet and 3–5 bullets grounded only in the excerpt."
-            usr = f"Excerpt:\n{ch}\n\nReturn a 1–2 sentence snippet, then 3–5 bullets of key points."
-            key = f"res::{date_s}::{title}::{model_preferred}"
             if layout_mode == "Compact cards":
                 st.markdown(f'<div class="card"><h4>{date_s} — <a href="{link}">{title}</a></h4>', unsafe_allow_html=True)
+                sys = "You are an IMF speech analyst. Produce a concise snippet and 3–5 bullets grounded only in the excerpt."
+                usr = f"Excerpt:\n{ch}\n\nReturn a 1–2 sentence snippet, then 3–5 bullets of key points."
+                key = f"res::{date_s}::{title}::{model_preferred}"
                 (md, used_model) = llm_cached(key, sys, usr, model=model_preferred,
-                                              max_tokens=per_item_tokens, temperature=0.2,
+                                              max_tokens=PER_ITEM_TOKENS, temperature=0.2,
                                               stream=True)
                 st.caption(f"Model: {used_model}")
                 st.markdown("</div>", unsafe_allow_html=True)
             else:
-                st.markdown(header_md)
+                st.markdown(f"**{date_s} — [{title}]({link})**")
+                sys = "You are an IMF speech analyst. Produce a concise snippet and 3–5 bullets grounded only in the excerpt."
+                usr = f"Excerpt:\n{ch}\n\nReturn a 1–2 sentence snippet, then 3–5 bullets of key points."
+                key = f"res::{date_s}::{title}::{model_preferred}"
                 (md, used_model) = llm_cached(key, sys, usr, model=model_preferred,
-                                              max_tokens=per_item_tokens, temperature=0.2,
+                                              max_tokens=PER_ITEM_TOKENS, temperature=0.2,
                                               stream=True)
                 st.caption(f"Model: {used_model}")
 
-        # Sources utility
+        # Pagination controls
+        col_a, col_b, col_c = st.columns([1, 2, 1])
+        with col_a:
+            if st.button("◀︎ Prev", disabled=(page <= 1)):
+                st.session_state.page = max(1, page - 1)
+                st.experimental_rerun()
+        with col_b:
+            st.markdown(f"<div style='text-align:center'>Page {page} of {total_pages} • Showing {start+1}–{end} of {total}</div>", unsafe_allow_html=True)
+        with col_c:
+            if st.button("Next ▶︎", disabled=(page >= total_pages)):
+                st.session_state.page = min(total_pages, page + 1)
+                st.experimental_rerun()
+
         with st.expander("Sources used on this page"):
-            page_sources = list(sources_from_speeches(display_list))
+            page_sources = list(sources_from_speeches(page_items))
             if not page_sources:
                 st.info("No sources to show.")
             else:
-                # Show as bullets
                 for (d, t, l) in page_sources:
                     st.markdown(f"- {d} — [{t}]({l})")
-                # One-click copy: present a textarea (copy icon built-in) + download
                 lines = [f"{d} — {t} — {l}" for (d,t,l) in page_sources]
                 all_sources_text = "\n".join(lines)
                 st.markdown("**Copy all sources:**")
@@ -272,7 +302,7 @@ with tab_res:
                 st.download_button("Download sources (.txt)", all_sources_text.encode("utf-8"),
                                    file_name="sources.txt", mime="text/plain")
 
-# ---------------- Thematic Evolution (unchanged core, better empty states) ----------------
+# ---------------- Thematic Evolution (Depth default) ----------------
 with tab_comp:
     if not speeches:
         st.info("Enter a search to analyze thematic evolution.")
@@ -288,56 +318,18 @@ with tab_comp:
             except Exception:
                 return False
 
-        range_items = [sp for sp in display_list if _within(sp["meta"], filters['date_from'], filters['date_to'])]
+        # Use the items currently visible (page) for a focused, depth-first feel
+        range_items = [sp for sp in page_items if _within(sp["meta"], filters['date_from'], filters['date_to'])]
 
         if not range_items:
-            st.warning("No matching content in this date range. Try broadening the range.")
+            st.warning("No matching content on this page in this date range. Try moving pages or broaden the range.")
         else:
-            by_year = {}
-            for sp in range_items:
-                m = sp["meta"]
-                y = int(m.get("year", 0) or str(m.get("date",""))[:4] or 0)
-                if y == 0: continue
-                by_year.setdefault(y, []).append(sp)
-            years_asc = sorted(by_year.keys())
-            year_span = filters['date_to'].year - filters['date_from'].year
-
-            ctx_for_evol = ""
-            if year_span >= 2 and years_asc:
-                per_year_limit = max(3, min(6, (12 if view_mode=="Depth" else 8) // max(1, len(years_asc))))
-                year_sections = []
-                for y in years_asc:
-                    hits = _to_hits(by_year[y])[:per_year_limit]
-                    ctx = format_hits_for_context(hits, limit=per_year_limit, char_limit=900)
-                    if ctx.strip():
-                        year_sections.append(f"=== Year {y} ===\n{ctx}")
-                full_ctx = "\n\n".join(year_sections) if year_sections else "(no matching context)"
-
-                sys1 = ("You are a senior IMF communications strategist. Using ONLY the provided context, "
-                        "produce issue-focused yearly summaries. Focus on substance; avoid speculation. "
-                        "Add (Month YYYY — Title) from headers when referencing specifics.")
-                usr1 = f"""Topic: {query}
-
-Date range: {filters['date_from'].isoformat()} → {filters['date_to'].isoformat()}
-
-Context grouped by year (each item starts with [YYYY-MM-DD — Title](link)):
-{full_ctx}
-
-Task: For each year in the range, list 3–5 ISSUE headings with 1–2 sentence summaries (no quotes). Keep it concise."""
-                st.markdown("### Per-Year Focus")
-                (focus_md, used_model1) = llm_cached(
-                    f"peryear::{query}::{filters['date_from']}::{filters['date_to']}::{model_preferred}",
-                    sys1, usr1, model=model_preferred, max_tokens=per_item_tokens,
-                    temperature=0.2, stream=True)
-                st.caption(f"Model: {used_model1}")
-                ctx_for_evol = full_ctx
-            else:
-                ctx_range = format_hits_for_context(_to_hits(range_items), limit=(ctx_limit+4))
-                sys_focus = (
-                    "You are a senior IMF communications strategist. Using ONLY the provided context, "
-                    "list key issue-focused takeaways for this date range."
-                )
-                usr_focus = f"""Topic: {query}
+            ctx_range = format_hits_for_context(_to_hits(range_items), limit=14)
+            sys_focus = (
+                "You are a senior IMF communications strategist. Using ONLY the provided context, "
+                "list key issue-focused takeaways for this date range."
+            )
+            usr_focus = f"""Topic: {query}
 
 Date range: {filters['date_from'].isoformat()} → {filters['date_to'].isoformat()}
 
@@ -345,13 +337,12 @@ Context:
 {ctx_range}
 
 Task: List 3–5 ISSUE headings with 1–2 sentence summaries (no quotes)."""
-                st.markdown("### Focus")
-                (focus_md, used_model1) = llm_cached(
-                    f"focus::{query}::{filters['date_from']}::{filters['date_to']}::{model_preferred}",
-                    sys_focus, usr_focus, model=model_preferred, max_tokens=per_item_tokens,
-                    temperature=0.2, stream=True)
-                st.caption(f"Model: {used_model1}")
-                ctx_for_evol = ctx_range
+            st.markdown("### Focus")
+            (focus_md, used_model1) = llm_cached(
+                f"focus::{query}::{filters['date_from']}::{filters['date_to']}::{DEFAULT_MODEL}",
+                sys_focus, usr_focus, model=DEFAULT_MODEL, max_tokens=PER_ITEM_TOKENS,
+                temperature=0.2, stream=True)
+            st.caption(f"Model: {used_model1}")
 
             sys2 = ("You analyze evolution across the full date range. Use ONLY context. "
                     "Be concrete: what gained emphasis, what was deemphasized, any NEW issues. "
@@ -360,13 +351,13 @@ Task: List 3–5 ISSUE headings with 1–2 sentence summaries (no quotes)."""
 Range: {filters['date_from'].isoformat()} → {filters['date_to'].isoformat()}
 
 Context:
-{ctx_for_evol}
+{ctx_range}
 
-Task: Write a short 'Messaging Evolution' narrative for the whole range (6–10 sentences, crisp)."""
+Task: Write a short 'Messaging Evolution' narrative for the range (6–10 sentences, crisp)."""
             st.markdown("### Messaging Evolution")
             (evol_md, used_model2) = llm_cached(
-                f"evol::{query}::{filters['date_from']}::{filters['date_to']}::{model_preferred}",
-                sys2, usr2, model=model_preferred, max_tokens=per_item_tokens,
+                f"evol::{query}::{filters['date_from']}::{filters['date_to']}::{DEFAULT_MODEL}",
+                sys2, usr2, model=DEFAULT_MODEL, max_tokens=PER_ITEM_TOKENS,
                 temperature=0.2, stream=True)
             st.caption(f"Model: {used_model2}")
 
@@ -381,8 +372,8 @@ if _HAS_P3:
             st.info("Enter a search above to view trajectory analysis.")
         else:
             st.subheader("Messaging Trajectory")
-            ctx = format_hits_for_context(_to_hits(display_list), limit=(ctx_limit+4))
-            series = build_issue_trajectory(query, ctx, model_preferred)  # DataFrame: year, issue, share
+            ctx = format_hits_for_context(_to_hits(page_items), limit=14)
+            series = build_issue_trajectory(query, ctx, DEFAULT_MODEL)  # DataFrame: year, issue, share
             if not series.empty:
                 fig = px.area(series, x="year", y="share", color="issue", groupnorm="fraction")
                 st.plotly_chart(fig, use_container_width=True)
@@ -391,7 +382,7 @@ if _HAS_P3:
                     st.markdown("**Next-year trend (simple forecast)**")
                     fig2 = px.bar(forecast, x="issue", y="forecast_share")
                     st.plotly_chart(fig2, use_container_width=True)
-                nar = trajectory_narrative(query, ctx, model_preferred)
+                nar = trajectory_narrative(query, ctx, DEFAULT_MODEL)
                 st.markdown(nar)
             else:
                 st.info("No trajectory could be derived from current context.")
@@ -407,20 +398,20 @@ with tab_rr:
                 index=index, metas=metas, chunks=chunks,
                 filters=filters,
                 sort="relevance",
-                precision=precision_mode,
+                precision=high_precision,
                 strictness=strictness,
                 exact_phrase=True,
                 exclude_terms=[],
-                core_topic_only=False,
+                core_topic_only=core_topic_only,
                 use_llm_rerank=True,
-                model=model_preferred
+                model=DEFAULT_MODEL
             )
         except Exception as e:
             st.error(f"Search failed: {e}")
             rr_speeches = []
 
-        rr_hits = _to_hits(rr_speeches[: (36 if view_mode == "Depth" else 20)])
-        ctx_rr = format_hits_for_context(rr_hits, limit=(ctx_limit+6))
+        rr_hits = _to_hits(rr_speeches[:30])
+        ctx_rr = format_hits_for_context(rr_hits, limit=18)
         if ctx_rr.strip():
             sys = (
                 "You are Kristalina Georgieva's communications aide. "
@@ -435,8 +426,8 @@ Context:
 Tasks:
 - Provide 3–5 bullet points addressing the inquiry.
 - Then write a short narrative paragraph synthesizing the answer."""
-            key = f"rr::{hashlib.sha256((inquiry+ctx_rr).encode()).hexdigest()}::{model_preferred}"
-            (rr_md, used_model) = llm_cached(key, sys, usr, model=model_preferred,
+            key = f"rr::{hashlib.sha256((inquiry+ctx_rr).encode()).hexdigest()}::{DEFAULT_MODEL}"
+            (rr_md, used_model) = llm_cached(key, sys, usr, model=DEFAULT_MODEL,
                                              max_tokens=500, temperature=0.2, stream=True)
             st.caption(f"Model: {used_model}")
             with st.expander("Show sources (Rapid Response)"):
@@ -465,20 +456,20 @@ with tab_draft:
                 index=index, metas=metas, chunks=chunks,
                 filters=filters,
                 sort=sort_key,
-                precision=precision_mode,
+                precision=high_precision,
                 strictness=strictness,
                 exact_phrase=False,
                 exclude_terms=[],
-                core_topic_only=False,
+                core_topic_only=core_topic_only,
                 use_llm_rerank=True,
-                model=model_preferred,
+                model=DEFAULT_MODEL,
             )
         except Exception as e:
             st.error(f"Search failed: {e}")
             draft_speeches = []
 
-        draft_hits = _to_hits(draft_speeches[: (36 if view_mode == "Depth" else 20)])
-        ctx = format_hits_for_context(draft_hits, limit=(ctx_limit+6))
+        draft_hits = _to_hits(draft_speeches[:30])
+        ctx = format_hits_for_context(draft_hits, limit=18)
 
         params = []
         if audience.strip(): params.append(f"Audience: {audience}")
@@ -501,7 +492,7 @@ Tasks:
 - Closing paragraph
 Return clean Markdown."""
         key = f"draft::{big_ideas}::{audience}::{venue}::{tone}::{style}"
-        (md, used_model) = llm_cached(key, sys, usr, model=model_preferred,
+        (md, used_model) = llm_cached(key, sys, usr, model=DEFAULT_MODEL,
                                       max_tokens=1200, temperature=0.3, stream=True)
         st.caption(f"Model: {used_model}")
         st.download_button("Download draft (Markdown)", md.encode("utf-8"), file_name="speech_draft.md", mime="text/markdown")
