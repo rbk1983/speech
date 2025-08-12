@@ -336,3 +336,7 @@ Return clean Markdown.
         st.markdown(md)
         st.caption(f"Model: {used_model}")
         st.download_button("Download draft (Markdown)", md.encode("utf-8"), file_name="speech_draft.md", mime="text/markdown")
+<<<<<<< codex/update-app-features-and-tabs
+
+=======
+>>>>>>> main
