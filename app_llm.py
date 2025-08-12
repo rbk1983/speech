@@ -44,8 +44,6 @@ def _ensure_index():
                 st.error(f"Error: {e}")
 
 if not query or not query.strip():
-    st.stop()
-
 sort_key = "newest" if sort == "Newest" else "relevance"
 
 speeches, total_before = retrieve_speeches(
