@@ -128,13 +128,22 @@ def doc_to_text(path: Path) -> str:
         return soup.get_text(separator="\n")
     raise RuntimeError(f"Unsupported document type: {suffix}")
 
-def ytdlp_fetch_audio(url: str, out_dir: Path) -> dict:
-    """Download best audio from a URL (YouTube/Vimeo/etc.) using yt-dlp.
+def ytdlp_fetch_audio(url: str, out_dir: Path, *, cookies_bytes: bytes | None = None, proxy: str | None = None) -> dict:
+    \"\"\"Download best audio from a URL (YouTube/Vimeo/etc.) using yt-dlp.
     Returns {'path': Path, 'title': str, 'ext': str, 'uploader': str, 'upload_date': 'YYYYMMDD'}
-    """
+    \"\"\"
     if not _YTDLP_OK:
         raise RuntimeError("yt-dlp not installed. Install with: pip install yt-dlp")
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    cookiefile = None
+    if cookies_bytes:
+        import tempfile
+        cf = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
+        cf.write(cookies_bytes)
+        cf.flush()
+        cookiefile = cf.name
+
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": str(out_dir / "%(title).200B.%(ext)s"),
@@ -147,13 +156,26 @@ def ytdlp_fetch_audio(url: str, out_dir: Path) -> dict:
         "postprocessors": [
             {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
         ],
+        # Harden against transient errors / throttling
+        "retries": 10,
+        "fragment_retries": 10,
+        "concurrent_fragment_downloads": 1,
+        # Try alternate player clients (helps with some 403s)
+        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
     }
+    if cookiefile:
+        ydl_opts["cookiefile"] = cookiefile
+    if proxy:
+        ydl_opts["proxy"] = proxy
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         if info is None:
             raise RuntimeError("yt-dlp failed to extract media info.")
         if "entries" in info and info["entries"]:
-            info = next(e for e in info["entries"] if e)  # first valid entry
+            info = next((e for e in info["entries"] if e), None)
+            if info is None:
+                raise RuntimeError("No playable entries in playlist.")
         title = info.get("title") or "audio"
         upload_date = info.get("upload_date")  # YYYYMMDD
         uploader = info.get("uploader") or info.get("channel")
@@ -830,6 +852,8 @@ with tab_ing:
     title_hint = st.text_input("Optional: Title override (if empty, filename or URL is used)")
 
     st.markdown("#### Fetch from YouTube/Vimeo")
+    cookie_upload = st.file_uploader("YouTube cookies.txt (optional, for age/region/consent-gated videos)", type=["txt"], accept_multiple_files=False, key="yt_cookies")
+    proxy_url = st.text_input("Proxy (optional)", placeholder="http://user:pass@host:port or http://host:port")
     video_url = st.text_input("Video URL", placeholder="https://www.youtube.com/watch?v=… or https://vimeo.com/…")
     spk_box = st.expander("Speaker filtering (optional)")
     with spk_box:
@@ -944,7 +968,8 @@ with tab_ing:
     # Fetch & transcribe flow
     if fetch_btn and video_url.strip():
         try:
-            info = ytdlp_fetch_audio(video_url, RAW_DIR)
+            cookies_bytes = cookie_upload.read() if cookie_upload is not None else None
+            info = ytdlp_fetch_audio(video_url, RAW_DIR, cookies_bytes=cookies_bytes, proxy=(proxy_url or None))
             raw_audio_path = info["path"]
             title = info["title"]
             # Transcribe with timestamps
@@ -1025,3 +1050,4 @@ with tab_ing:
 
         except Exception as e:
             st.error(f"Fetch/transcribe failed: {e}")
+            st.info("If this is a YouTube 403/age/region error, try adding a cookies.txt from your browser and/or specifying a proxy above, then retry.")
