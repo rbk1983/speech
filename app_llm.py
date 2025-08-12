@@ -1,5 +1,5 @@
-# app_llm.py — Ingest & Sync with YouTube/Vimeo fetch + Year-by-Year Evolution + Pagination
-import os, datetime as _dt, hashlib, math, json, re, tempfile
+# app_llm.py — Ingest & Sync with YouTube/Vimeo fetch + Speaker filtering + Year-by-Year Evolution + Pagination
+import os, datetime as _dt, hashlib, math, json, re, tempfile, io
 from pathlib import Path
 import pandas as pd
 import streamlit as st
@@ -51,8 +51,23 @@ except Exception:
     yt_dlp = None
     _YTDLP_OK = False
 
-# FFMPEG presence improves yt-dlp audio extraction; most envs include it.
-# OpenAI Whisper fallback
+# Optional: diarization + speaker embedding
+try:
+    from pyannote.audio import Pipeline as _PyannotePipeline  # type: ignore
+    _PYANNOTE_OK = True
+except Exception:
+    _PyannotePipeline = None
+    _PYANNOTE_OK = False
+
+try:
+    import torch  # type: ignore
+    from speechbrain.pretrained import EncoderClassifier  # type: ignore
+    _SB_OK = True
+except Exception:
+    EncoderClassifier = None
+    _SB_OK = False
+
+# OpenAI Whisper fallback for transcription with timestamps
 try:
     from openai import OpenAI
     _OPENAI_OK = True
@@ -66,11 +81,13 @@ def _safe_slug(s: str) -> str:
 def _now_iso():
     return _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
-# Whisper transcription using either helper or OpenAI API if key present
-def transcribe_bytes(file_bytes: bytes, filename: str) -> str:
+# Whisper transcription using either helper or OpenAI API (returns text and optional segments)
+def transcribe_bytes(file_bytes: bytes, filename: str):
+    """Return dict: {'text': str, 'segments': list|None}"""
     if whisper_transcribe:
         try:
-            return whisper_transcribe(file_bytes, filename)
+            text = whisper_transcribe(file_bytes, filename)
+            return {"text": text, "segments": None}
         except Exception as e:
             raise RuntimeError(f"whisper_transcribe failed: {e}")
     if not _OPENAI_OK or not os.getenv("OPENAI_API_KEY"):
@@ -82,8 +99,10 @@ def transcribe_bytes(file_bytes: bytes, filename: str) -> str:
         tmp_name = tmp.name
     try:
         with open(tmp_name, "rb") as f:
-            transcript = client.audio.transcriptions.create(model="whisper-1", file=f)
-        return transcript.text
+            resp = client.audio.transcriptions.create(model="whisper-1", file=f, response_format="verbose_json")
+        text = getattr(resp, "text", None) or (resp.get("text") if isinstance(resp, dict) else None)
+        segments = getattr(resp, "segments", None) or (resp.get("segments") if isinstance(resp, dict) else None)
+        return {"text": text or "", "segments": segments}
     finally:
         try: os.remove(tmp_name)
         except Exception: pass
@@ -146,6 +165,117 @@ def ytdlp_fetch_audio(url: str, out_dir: Path) -> dict:
             raise RuntimeError("Audio file not found after download.")
         path = candidates[0]
         return {"path": path, "title": title, "ext": path.suffix.lstrip("."), "uploader": uploader, "upload_date": upload_date}
+
+# ----- Speaker filtering helpers (optional) -----
+def _load_diarization_pipeline():
+    """Load pyannote diarization with HF token if available."""
+    if not _PYANNOTE_OK:
+        raise RuntimeError("pyannote.audio not installed. pip install pyannote.audio")
+    hf_token = os.getenv("HUGGINGFACE_TOKEN") or os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
+    if not hf_token:
+        raise RuntimeError("Set HUGGINGFACE_TOKEN to use diarization (pyannote/speaker-diarization).")
+    pipeline = _PyannotePipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=hf_token)
+    return pipeline
+
+def _load_spk_encoder():
+    if not _SB_OK:
+        raise RuntimeError("speechbrain not installed. pip install speechbrain torch")
+    enc = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb")
+    return enc
+
+def _wav_bytes_from_path(path: Path) -> bytes:
+    # yt-dlp produced mp3; speechbrain handles multiple formats via torchaudio backend
+    with open(path, "rb") as f:
+        return f.read()
+
+def _speaker_embed(encoder, wav_path: Path):
+    import torchaudio  # type: ignore
+    signal, sr = torchaudio.load(str(wav_path))
+    if signal.shape[0] > 1:
+        signal = signal.mean(dim=0, keepdim=True)
+    emb = encoder.encode_batch(signal)
+    return emb.squeeze().detach().cpu()
+
+def diarize_and_filter_audio(audio_path: Path, transcript, ref_audio_file) -> dict:
+    """Return {'text': str, 'segments': list|None} filtered to the speaker most similar to ref audio.
+       transcript is dict from transcribe_bytes (needs 'segments' with timestamps).
+    """
+    # Ensure we have segments with timestamps
+    segments = transcript.get("segments")
+    if not segments:
+        raise RuntimeError("Transcript lacks timestamps; cannot align segments to speakers. Use Whisper with 'verbose_json'.")
+
+    # Diarize
+    pipeline = _load_diarization_pipeline()
+    diar = pipeline(str(audio_path))
+    # Build speaker->time windows
+    spk_windows = {}
+    for turn, _, speaker in diar.itertracks(yield_label=True):
+        spk_windows.setdefault(speaker, []).append((turn.start, turn.end))
+
+    # Build reference embedding
+    encoder = _load_spk_encoder()
+    # Save reference bytes to temp file to pass through torchaudio
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as t:
+        t.write(ref_audio_file.getvalue())
+        ref_path = Path(t.name)
+    try:
+        ref_emb = _speaker_embed(encoder, ref_path)
+    finally:
+        try: os.remove(ref_path)
+        except Exception: pass
+
+    # For each diarized speaker, compute embedding by pooling segments (first N seconds)
+    import torchaudio  # type: ignore
+    sims = {}
+    for spk, wins in spk_windows.items():
+        # Extract up to ~30 seconds for embedding
+        # Load full file once
+        waveform, sr = torchaudio.load(str(audio_path))
+        if waveform.shape[0] > 1: waveform = waveform.mean(dim=0, keepdim=True)
+        # Collate samples from windows
+        total = int(sr * 30)
+        chunks = []
+        acc = 0
+        for (s,e) in wins:
+            s_i = max(0, int(s * sr)); e_i = min(waveform.shape[-1], int(e * sr))
+            if e_i > s_i:
+                seg = waveform[:, s_i:e_i]
+                chunks.append(seg)
+                acc += seg.shape[-1]
+                if acc >= total: break
+        if not chunks: continue
+        pooled = torch.cat(chunks, dim=1)
+        # Temp save pooled to file-like for encoder reuse
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmpw:
+            torchaudio.save(tmpw.name, pooled, sr)
+            spk_emb = _speaker_embed(encoder, Path(tmpw.name))
+        # cosine similarity
+        cos = torch.nn.functional.cosine_similarity(ref_emb.unsqueeze(0), spk_emb.unsqueeze(0)).item()
+        sims[spk] = cos
+
+    if not sims:
+        raise RuntimeError("Could not compute speaker similarities; check audio quality and dependencies.")
+
+    # Pick best-matching diarized speaker
+    target_spk = max(sims, key=sims.get)
+
+    # Filter transcript segments whose midpoint falls inside target speaker windows
+    def midpoint(seg):
+        start = float(seg.get("start", 0))
+        end = float(seg.get("end", start))
+        return (start + end) / 2.0
+
+    def in_windows(t, windows):
+        for (s, e) in windows:
+            if s <= t <= e:
+                return True
+        return False
+
+    target_windows = spk_windows[target_spk]
+    kept = [seg for seg in segments if in_windows(midpoint(seg), target_windows)]
+    text = " ".join([seg.get("text","") for seg in kept]).strip()
+    return {"text": text, "segments": kept}
 
 # ----- Defaults (kept simple) -----
 PER_ITEM_TOKENS = 400   # Longer = richer bullets/snippets; shorter = terser (cheaper)
@@ -701,11 +831,18 @@ with tab_ing:
 
     st.markdown("#### Fetch from YouTube/Vimeo")
     video_url = st.text_input("Video URL", placeholder="https://www.youtube.com/watch?v=… or https://vimeo.com/…")
+    spk_box = st.expander("Speaker filtering (optional)")
+    with spk_box:
+        st.caption("If the video has multiple speakers, you can filter to **only Kristalina** using diarization + voice matching.")
+        enable_spk_filter = st.toggle("Filter to a specific speaker (Kristalina)", value=False)
+        ref_voice = st.file_uploader("Upload a short reference audio of Kristalina (5–20s WAV/MP3 recommended)", type=["wav","mp3","m4a"])
+        st.caption("Requires: pyannote.audio + a Hugging Face token in `HUGGINGFACE_TOKEN`, and speechbrain + torch.")
+
     colf1, colf2 = st.columns([1,2])
     with colf1:
         fetch_btn = st.button("Fetch & Transcribe")
     with colf2:
-        st.caption("Uses yt-dlp to download best audio and Whisper to transcribe (requires `yt-dlp`, `ffmpeg`, and an API key or local Whisper).")
+        st.caption("Uses yt-dlp to download best audio and Whisper to transcribe (needs `yt-dlp`, `ffmpeg`, and an API key or local Whisper).")
 
     added = []
     errors = []
@@ -729,7 +866,8 @@ with tab_ing:
                     }
                     # Normalize to text
                     if raw_path.suffix.lower() in [".mp3",".wav",".m4a",".mp4",".mov",".avi",".mkv"]:
-                        text_out = transcribe_bytes(uf.getbuffer(), uf.name)
+                        tr = transcribe_bytes(uf.getbuffer(), uf.name)
+                        text_out = tr["text"]
                     else:
                         text_out = doc_to_text(raw_path)
 
@@ -797,7 +935,6 @@ with tab_ing:
         # Reload index in-session
         if added:
             try:
-
                 index, metas, chunks = load_index()
                 df = load_df()
                 st.toast("Index reloaded.", icon="✅")
@@ -807,12 +944,29 @@ with tab_ing:
     # Fetch & transcribe flow
     if fetch_btn and video_url.strip():
         try:
-            slug_hint = _safe_slug(video_url)
             info = ytdlp_fetch_audio(video_url, RAW_DIR)
             raw_audio_path = info["path"]
             title = info["title"]
-            # Transcribe
-            text_out = transcribe_bytes(raw_audio_path.read_bytes(), raw_audio_path.name)
+            # Transcribe with timestamps
+            tr = transcribe_bytes(raw_audio_path.read_bytes(), raw_audio_path.name)
+            text_out = tr["text"]
+
+            # Optional: speaker filtering to Kristalina
+            filtered_used = False
+            if enable_spk_filter:
+                if not ref_voice:
+                    st.warning("Upload a reference audio to enable speaker filtering.")
+                else:
+                    try:
+                        filtered = diarize_and_filter_audio(raw_audio_path, tr, ref_voice)
+                        if filtered.get("text"):
+                            text_out = filtered["text"]
+                            filtered_used = True
+                            st.success("Applied speaker filtering: kept segments matching the reference voice.")
+                        else:
+                            st.info("Speaker filtering produced no segments; using full transcript.")
+                    except Exception as e:
+                        st.warning(f"Speaker filtering skipped: {e}")
 
             proc_name = f"{_safe_slug(title)}.txt"
             proc_path = PROC_DIR / proc_name
@@ -828,6 +982,7 @@ with tab_ing:
                 "upload_date": info.get("upload_date"),
                 "ingested_at": _now_iso(),
                 "type": "audio",
+                "speaker_filtered": bool(filtered_used),
             }
             (META_DIR / f"{_safe_slug(title)}.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
             st.success(f"Fetched & transcribed: {title}")
