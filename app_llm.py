@@ -797,7 +797,7 @@ with tab_ing:
         # Reload index in-session
         if added:
             try:
-                global index, metas, chunks, df
+
                 index, metas, chunks = load_index()
                 df = load_df()
                 st.toast("Index reloaded.", icon="✅")
