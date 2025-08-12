@@ -6,18 +6,37 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 
+# --- Import utilities with safe fallback for `llm_stream` ---
 from rag_utils import (
     load_df, load_index,
     retrieve_speeches, sources_from_speeches,
-    format_hits_for_context, llm, llm_stream
+    format_hits_for_context, llm
 )
+
+# Some deployments don't expose `llm_stream`. Provide a graceful fallback so the app doesn't crash.
+try:
+    from rag_utils import llm_stream  # type: ignore
+except Exception:
+    def llm_stream(system_prompt, user_prompt, *, model="gpt-4o-mini",
+                   max_tokens=700, temperature=0.3):
+        """Fallback streaming shim: call `llm` once and yield the full text.
+        Returns (generator, used_model) to match the expected signature.
+        """
+        text = llm(system_prompt, user_prompt,
+                   model=model, max_tokens=max_tokens, temperature=temperature)
+
+        def _gen():
+            yield text
+
+        return _gen(), model
 
 _LLM_CACHE = {}
 
-
 def llm_cached(key, system_prompt, user_prompt, *, model="gpt-4o-mini",
                max_tokens=700, temperature=0.3, stream=False):
-    """Cache around llm helpers. When `stream=True`, content streams in real time."""
+    """Cache around llm helpers. When `stream=True`, content streams in real time.
+    Works whether `llm_stream` exists in rag_utils or not.
+    """
     if key in _LLM_CACHE:
         text, used_model = _LLM_CACHE[key]
         if stream:
@@ -28,6 +47,7 @@ def llm_cached(key, system_prompt, user_prompt, *, model="gpt-4o-mini",
         gen, used_model = llm_stream(system_prompt, user_prompt,
                                      model=model, max_tokens=max_tokens,
                                      temperature=temperature)
+        # Streamlit 1.32+: write_stream consumes a generator and returns the full text
         text = st.write_stream(gen)
         out = (text, used_model)
     else:
@@ -36,6 +56,7 @@ def llm_cached(key, system_prompt, user_prompt, *, model="gpt-4o-mini",
                        max_tokens=max_tokens, temperature=temperature)
             out = (text, model)
         except Exception:
+            # Fallback model if the preferred fails
             fallback = "gpt-4o-mini"
             text = llm(system_prompt, user_prompt, model=fallback,
                        max_tokens=max_tokens, temperature=temperature)
