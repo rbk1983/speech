@@ -12,6 +12,23 @@ from rag_utils import (
     format_hits_for_context, llm
 )
 
+_LLM_CACHE = {}
+
+
+def llm_cached(key, system_prompt, user_prompt, *, model="gpt-4o-mini", max_tokens=700, temperature=0.3):
+    """Lightweight cache around `llm` helper, returning (text, model_used)."""
+    if key in _LLM_CACHE:
+        return _LLM_CACHE[key]
+    try:
+        text = llm(system_prompt, user_prompt, model=model, max_tokens=max_tokens, temperature=temperature)
+        out = (text, model)
+    except Exception:
+        fallback = "gpt-4o-mini"
+        text = llm(system_prompt, user_prompt, model=fallback, max_tokens=max_tokens, temperature=temperature)
+        out = (text, fallback)
+    _LLM_CACHE[key] = out
+    return out
+
 # Optional Phase 3 imports (soft)
 try:
     from phase3_utils import (
@@ -43,7 +60,38 @@ def _ensure_index():
             except Exception as e:
                 st.error(f"Error: {e}")
 
+# Load data and index
+_ensure_index()
+df = load_df()
+index, metas, chunks = load_index()
+
+# Query input
+query = st.text_input("Search speeches", "")
 if not query or not query.strip():
+    st.stop()
+
+# Retrieval controls
+c1, c2, c3 = st.columns(3)
+with c1:
+    sort = st.selectbox("Sort", ["Newest", "Relevance"], index=0)
+    precision_mode = st.toggle("High precision ranking", value=True)
+    strictness = st.slider("Strictness", 0.0, 1.0, 0.6, 0.05)
+with c2:
+    exact_phrase = st.toggle("Exact phrase", value=True)
+    exclude_terms = st.text_input("Exclude terms (comma-separated)", "")
+    core_topic_only = st.toggle("Core topic only", value=False)
+with c3:
+    min_date = df["date"].min().date()
+    max_date = df["date"].max().date()
+    date_from = st.date_input("Date from", min_date)
+    date_to = st.date_input("Date to", max_date)
+filters = {"date_from": date_from, "date_to": date_to}
+
+view_mode = st.selectbox("View mode", ["Depth", "Breadth"], index=0)
+ctx_limit = st.slider("Context items per section", 6, 20, 12)
+model_preferred = st.selectbox("Model", ["gpt-4o-mini", "gpt-4o"], index=0)
+per_item_tokens = st.slider("Tokens per item", 200, 1000, 400, step=50)
+
 sort_key = "newest" if sort == "Newest" else "relevance"
 
 speeches, total_before = retrieve_speeches(
