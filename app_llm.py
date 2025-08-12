@@ -41,9 +41,9 @@ def _ensure_index():
                 build_index_main()
                 st.success("Index built. Click **Rerun** or refresh."); st.stop()
             except Exception as e:
-@@ -145,353 +132,295 @@ if not query or not query.strip():
-    st.stop()
+                st.error(f"Error: {e}")
 
+if not query or not query.strip():
 sort_key = "newest" if sort == "Newest" else "relevance"
 
 speeches, total_before = retrieve_speeches(
@@ -336,7 +336,3 @@ Return clean Markdown.
         st.markdown(md)
         st.caption(f"Model: {used_model}")
         st.download_button("Download draft (Markdown)", md.encode("utf-8"), file_name="speech_draft.md", mime="text/markdown")
-<<<<<<< codex/update-app-features-and-tabs
-
-=======
->>>>>>> main
