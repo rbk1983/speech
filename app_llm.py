@@ -161,7 +161,7 @@ with tab_res:
             m = sp["meta"]; ch = sp["best_chunk"]
             st.markdown(f"**{m.get('date')} — [{m.get('title')}]({m.get('link')})**")
             sys = "You are an IMF speech analyst. Produce a concise snippet and 3–5 bullets grounded only in the excerpt."
-            usr = f"Excerpt:\\n{ch}\\n\\nReturn a 1–2 sentence snippet, then 3–5 bullets of key points."
+            usr = f"Excerpt:\n{ch}\n\nReturn a 1–2 sentence snippet, then 3–5 bullets of key points."
             key = f"res::{m.get('date')}::{m.get('title')}::{model_preferred}"
             (md, used_model) = llm_cached(key, sys, usr, model=model_preferred,
                                          max_tokens=per_item_tokens, temperature=0.2,
@@ -211,8 +211,8 @@ with tab_comp:
                     hits = _to_hits(by_year[y])[:per_year_limit]
                     ctx = format_hits_for_context(hits, limit=per_year_limit, char_limit=900)
                     if ctx.strip():
-                        year_sections.append(f"=== Year {y} ===\\n{ctx}")
-                full_ctx = "\\n\\n".join(year_sections) if year_sections else "(no matching context)"
+                        year_sections.append(f"=== Year {y} ===\n{ctx}")
+                full_ctx = "\n\n".join(year_sections) if year_sections else "(no matching context)"
 
                 sys1 = ("You are a senior IMF communications strategist. Using ONLY the provided context, "
                         "produce issue-focused yearly summaries. Focus on substance; avoid speculation. "
@@ -351,7 +351,7 @@ with tab_rr:
             precision=precision_mode,
             strictness=strictness,
             exact_phrase=True,
-            exclude_terms[],
+            exclude_terms=[],
             core_topic_only=False,
             use_llm_rerank=True,
             model=model_preferred
@@ -402,7 +402,7 @@ with tab_draft:
             precision=precision_mode,
             strictness=strictness,
             exact_phrase=False,
-            exclude_terms[],
+            exclude_terms=[],
             core_topic_only=False,
             use_llm_rerank=True,
             model=model_preferred,
