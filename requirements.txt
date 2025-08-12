@@ -15,3 +15,7 @@ gitpython
 pdfminer.six
 docx2txt
 beautifulsoup4
+pyannote.audio
+speechbrain
+torch
+torchaudio
