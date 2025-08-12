@@ -1,5 +1,6 @@
-# app_llm.py — Simplified UI, real newest-first, pagination
-import os, datetime as _dt, hashlib, math
+# app_llm.py — Simplified UI + Ingest & Sync tab
+import os, datetime as _dt, hashlib, math, json, shutil, re
+from pathlib import Path
 import pandas as pd
 import streamlit as st
 import plotly.express as px
@@ -11,30 +12,116 @@ from rag_utils import (
     format_hits_for_context, llm
 )
 
+# Optional helpers that may or may not exist in your environment
 try:
-    from rag_utils import llm_stream  # type: ignore
+    from rag_utils import whisper_transcribe  # optional convenience
 except Exception:
-    def llm_stream(system_prompt, user_prompt, *, model="gpt-4o-mini",
-                   max_tokens=700, temperature=0.3):
-        text = llm(system_prompt, user_prompt,
-                   model=model, max_tokens=max_tokens, temperature=temperature)
-        def _gen():
-            yield text
-        return _gen(), model
+    whisper_transcribe = None
+
+try:
+    from build_index import main as build_index_main
+except Exception:
+    build_index_main = None
+
+try:
+    import git  # GitPython (optional)
+except Exception:
+    git = None
+
+try:
+    import docx2txt  # optional for .docx -> text
+except Exception:
+    docx2txt = None
+
+try:
+    import pdfminer.high_level as pdfminer_high  # optional for .pdf -> text
+except Exception:
+    pdfminer_high = None
+
+try:
+    from bs4 import BeautifulSoup  # optional for .html -> text
+except Exception:
+    BeautifulSoup = None
+
+try:
+    from openai import OpenAI  # whisper fallback (cloud)
+    _OPENAI_OK = True
+except Exception:
+    _OPENAI_OK = False
+
+def _safe_slug(s: str) -> str:
+    s = re.sub(r'[^A-Za-z0-9._-]+', '_', s).strip('_')
+    return s or "unnamed"
+
+def _now_iso():
+    return _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+# Whisper transcription using either helper or OpenAI API if key present
+def transcribe_bytes(file_bytes: bytes, filename: str) -> str:
+    if whisper_transcribe:
+        try:
+            return whisper_transcribe(file_bytes, filename)
+        except Exception as e:
+            raise RuntimeError(f"whisper_transcribe failed: {e}")
+    if not _OPENAI_OK or not os.getenv("OPENAI_API_KEY"):
+        raise RuntimeError("Transcription unavailable: set OPENAI_API_KEY or add a whisper_transcribe helper.")
+    # Minimal OpenAI Whisper v1 usage (non-streaming)
+    client = OpenAI()
+    import tempfile
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        tmp.write(file_bytes)
+        tmp.flush()
+        tmp_name = tmp.name
+    try:
+        with open(tmp_name, "rb") as f:
+            # model name may vary; adjust if your account uses a different one
+            transcript = client.audio.transcriptions.create(model="whisper-1", file=f)
+        return transcript.text
+    finally:
+        try: os.remove(tmp_name)
+        except Exception: pass
+
+def doc_to_text(path: Path) -> str:
+    """Convert supported docs to raw text."""
+    suffix = path.suffix.lower()
+    if suffix == ".txt" or suffix == ".md":
+        return path.read_text(encoding="utf-8", errors="ignore")
+    if suffix == ".docx":
+        if not docx2txt:
+            raise RuntimeError("docx2txt not installed; cannot parse .docx.")
+        return docx2txt.process(str(path)) or ""
+    if suffix == ".pdf":
+        if not pdfminer_high:
+            raise RuntimeError("pdfminer.six not installed; cannot parse .pdf.")
+        return pdfminer_high.extract_text(str(path)) or ""
+    if suffix in [".html", ".htm"]:
+        if not BeautifulSoup:
+            raise RuntimeError("bs4 not installed; cannot parse .html.")
+        html = path.read_text(encoding="utf-8", errors="ignore")
+        soup = BeautifulSoup(html, "html.parser")
+        return soup.get_text(separator="\n")
+    raise RuntimeError(f"Unsupported document type: {suffix}")
 
 # ----- Defaults (kept simple) -----
 PER_ITEM_TOKENS = 400   # Longer = richer bullets/snippets (more cost); Shorter = terser (cheaper)
 DEFAULT_MODEL   = "gpt-4o-mini"
 
+# Cache for LLM results
 _LLM_CACHE = {}
 def llm_cached(key, system_prompt, user_prompt, *, model=DEFAULT_MODEL,
                max_tokens=PER_ITEM_TOKENS, temperature=0.3, stream=False):
+    from rag_utils import llm as _llm
+    try:
+        from rag_utils import llm_stream  # type: ignore
+    except Exception:
+        llm_stream = None
+
     if key in _LLM_CACHE:
         text, used_model = _LLM_CACHE[key]
         if stream:
             st.markdown(text)
         return text, used_model
-    if stream:
+    if stream and llm_stream:
         gen, used_model = llm_stream(system_prompt, user_prompt,
                                      model=model, max_tokens=max_tokens,
                                      temperature=temperature)
@@ -42,18 +129,18 @@ def llm_cached(key, system_prompt, user_prompt, *, model=DEFAULT_MODEL,
         out = (text, used_model)
     else:
         try:
-            text = llm(system_prompt, user_prompt, model=model,
-                       max_tokens=max_tokens, temperature=temperature)
+            text = _llm(system_prompt, user_prompt, model=model,
+                        max_tokens=max_tokens, temperature=temperature)
             out = (text, model)
         except Exception:
             fallback = DEFAULT_MODEL
-            text = llm(system_prompt, user_prompt, model=fallback,
-                       max_tokens=max_tokens, temperature=temperature)
+            text = _llm(system_prompt, user_prompt, model=fallback,
+                        max_tokens=max_tokens, temperature=temperature)
             out = (text, fallback)
     _LLM_CACHE[key] = out
     return out
 
-# Optional Phase 3 imports (soft)
+# Phase 3 utils (optional)
 try:
     from phase3_utils import (
         build_issue_trajectory, forecast_issue_trends, trajectory_narrative
@@ -80,6 +167,7 @@ st.markdown("""
   box-shadow: 0 1px 4px rgba(0,0,0,.04);
 }
 .card h4{ margin: 0 0 .25rem 0; }
+.small { font-size: 0.9rem; color: #666; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -98,8 +186,8 @@ def _ensure_index():
     if st.button("Build index now"):
         with st.spinner("Building index…"):
             try:
-                from build_index import main as build_index_main
-                build_index_main()
+                from build_index import main as build_index_main_local
+                build_index_main_local()
                 st.success("Index built. Click **Rerun** or refresh."); st.stop()
             except Exception as e:
                 st.error(f"Index build failed: {e}")
@@ -143,7 +231,6 @@ with st.container():
         high_precision = st.toggle("High precision ranking", value=True, help="Better ranking via dense retrieval + reranking + diversity controls.")
     st.markdown('</div>', unsafe_allow_html=True)
 
-# Simplification note: We keep DEPTH as the default philosophy (richer context per item).
 st.caption("Mode: **Depth** — returns fewer items per step but with richer context for better summaries.")
 
 # Advanced (collapsed)
@@ -175,8 +262,6 @@ def reset_pagination():
 
 speeches, total_before = [], 0
 if query and query.strip():
-    # Reset pagination when query/filters change (simple heuristic)
-    # Use a fingerprint to detect changes
     fp = f"{query}|{date_from}|{date_to}|{sort_key}|{exact_phrase}|{high_precision}|{core_topic_only}|{strictness}"
     if st.session_state.get("fp") != fp:
         st.session_state.fp = fp
@@ -190,7 +275,7 @@ if query and query.strip():
             precision=high_precision,
             strictness=strictness,
             exact_phrase=exact_phrase,
-            exclude_terms=[],            # removed from UI by request
+            exclude_terms=[],
             core_topic_only=core_topic_only,
             use_llm_rerank=True,
             model=model_preferred
@@ -211,24 +296,26 @@ else:
     st.info("Enter a search term above to explore speeches.")
 
 # ---------------- Tabs ----------------
-tabs = ["Results", "Thematic Evolution", "Briefing Pack", "Rapid Response", "Draft Assist"]
+tabs = ["Results", "Thematic Evolution", "Briefing Pack", "Rapid Response", "Draft Assist", "Ingest & Sync"]
 try:
-    if _HAS_P3:
-        tabs.insert(3, "Trajectory")
+    from phase3_utils import build_issue_trajectory  # check existence
+    tabs.insert(3, "Trajectory")
+    _HAS_P3 = True
 except Exception:
-    pass
+    _HAS_P3 = False
+
 tab_objs = st.tabs(tabs)
 
+# Map tabs
 tab_res  = tab_objs[0]
 tab_comp = tab_objs[1]
 tab_brief = tab_objs[2]
+offset = 0
 if _HAS_P3:
-    tab_traj = tab_objs[3]
-    tab_rr  = tab_objs[4]
-    tab_draft = tab_objs[5]
-else:
-    tab_rr   = tab_objs[3]
-    tab_draft = tab_objs[4]
+    tab_traj = tab_objs[3]; offset = 1
+tab_rr   = tab_objs[3+offset]
+tab_draft= tab_objs[4+offset]
+tab_ing  = tab_objs[5+offset]
 
 def _to_hits(items):
     return [(sp["best_idx"], sp["meta"], sp["best_chunk"]) for sp in items]
@@ -318,7 +405,6 @@ with tab_comp:
             except Exception:
                 return False
 
-        # Use the items currently visible (page) for a focused, depth-first feel
         range_items = [sp for sp in page_items if _within(sp["meta"], filters['date_from'], filters['date_to'])]
 
         if not range_items:
@@ -498,3 +584,124 @@ Return clean Markdown."""
         st.download_button("Download draft (Markdown)", md.encode("utf-8"), file_name="speech_draft.md", mime="text/markdown")
     else:
         st.info("Provide big ideas and optional parameters, then click Draft outline.")
+
+# ---------------- Ingest & Sync tab ----------------
+with tab_ing:
+    st.subheader("Ingest & Sync")
+    st.markdown(
+        "<div class='small'>Upload new sources (PDF, DOCX, TXT/MD, HTML, audio/video). "
+        "They will be stored under <code>./corpus/</code>, normalized to text, and the index can be rebuilt. "
+        "If this folder is a Git repo with a remote, I’ll try to commit & push.</div>", unsafe_allow_html=True
+    )
+
+    # Corpus directories
+    RAW_DIR = Path("corpus/raw")
+    PROC_DIR = Path("corpus/processed")
+    META_DIR = Path("corpus/meta")
+    for p in [RAW_DIR, PROC_DIR, META_DIR]:
+        p.mkdir(parents=True, exist_ok=True)
+
+    up_files = st.file_uploader("Upload files", type=[
+        "pdf","docx","txt","md","html","htm",
+        "mp3","wav","m4a","mp4","mov","avi","mkv"
+    ], accept_multiple_files=True)
+    url = st.text_input("Optional: Source URL (YouTube, web page, etc.)", placeholder="https://…")
+    title_hint = st.text_input("Optional: Title override (if empty, filename or URL is used)")
+
+    if st.button("Ingest sources"):
+        added = []
+        errors = []
+
+        # Handle file uploads
+        if up_files:
+            for uf in up_files:
+                try:
+                    slug = _safe_slug(uf.name)
+                    raw_path = RAW_DIR / slug
+                    raw_path.write_bytes(uf.getbuffer())
+
+                    meta = {
+                        "title": title_hint or uf.name,
+                        "source": "upload",
+                        "filename": uf.name,
+                        "stored_at": str(raw_path),
+                        "ingested_at": _now_iso(),
+                        "type": Path(uf.name).suffix.lower().lstrip("."),
+                    }
+                    # Normalize to text
+                    text_out = ""
+                    if raw_path.suffix.lower() in [".mp3",".wav",".m4a",".mp4",".mov",".avi",".mkv"]:
+                        text_out = transcribe_bytes(uf.getbuffer(), uf.name)
+                    else:
+                        text_out = doc_to_text(raw_path)
+
+                    proc_name = f"{slug}.txt"
+                    proc_path = PROC_DIR / proc_name
+                    proc_path.write_text(text_out, encoding="utf-8")
+
+                    meta["normalized_text"] = str(proc_path)
+                    (META_DIR / f"{slug}.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+                    added.append(slug)
+                except Exception as e:
+                    errors.append(f"{uf.name}: {e}")
+
+        # Handle simple URL capture (store URL meta; actual fetching left to external job if needed)
+        if url.strip():
+            try:
+                slug = _safe_slug(url)
+                meta = {
+                    "title": title_hint or url,
+                    "source": "url",
+                    "url": url,
+                    "ingested_at": _now_iso(),
+                    "note": "Stored URL reference; fetch/transcribe externally or paste content as .txt for now."
+                }
+                (META_DIR / f"{slug}.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+                added.append(slug)
+            except Exception as e:
+                errors.append(f"URL save failed: {e}")
+
+        # Feedback
+        if added:
+            st.success(f"Ingested: {', '.join(added)}")
+        if errors:
+            st.error("Some items failed:\n" + "\n".join(errors))
+
+        # Rebuild index
+        if added:
+            if build_index_main:
+                with st.spinner("Rebuilding index…"):
+                    try:
+                        build_index_main()
+                        st.success("Index rebuilt.")
+                    except Exception as e:
+                        st.error(f"Index rebuild failed: {e}")
+            else:
+                st.info("Index builder not found. Ensure build_index.py is available with `main()` entrypoint.")
+
+            # Try git add/commit/push
+            try:
+                repo = git.Repo(".", search_parent_directories=True) if git else None
+                if repo:
+                    repo.index.add([str(RAW_DIR), str(PROC_DIR), str(META_DIR), "index.faiss", "meta.json", "chunks.json"])
+                    repo.index.commit(f"Ingest via app: {len(added)} new source(s)")
+                    if repo.remotes:
+                        origin = repo.remotes.origin
+                        origin.push()
+                        st.success("Changes pushed to remote.")
+                    else:
+                        st.info("No git remote configured. Commit saved locally.")
+                else:
+                    st.info("GitPython not installed or not a git repo. Skipped commit/push.")
+            except Exception as e:
+                st.warning(f"Git sync skipped/failed: {e}")
+
+        # Reload index in-session
+        if added:
+            try:
+                global index, metas, chunks, df
+                index, metas, chunks = load_index()
+                df = load_df()
+                st.toast("Index reloaded.", icon="✅")
+            except Exception as e:
+                st.warning(f"Reload failed (you may need to rerun): {e}")
