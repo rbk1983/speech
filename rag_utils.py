@@ -292,3 +292,43 @@ def llm(system_prompt, user_prompt, model="gpt-4o-mini", max_tokens=700, tempera
             try: return _call(fb)
             except Exception: continue
         raise
+
+
+def llm_stream(system_prompt, user_prompt, model="gpt-4o-mini", max_tokens=700, temperature=0.3):
+    """Streamed variant of ``llm`` returning (generator, model_used)."""
+
+    def _stream_from(resp):
+        for chunk in resp:
+            txt = chunk.choices[0].delta.content or ""
+            if txt:
+                yield txt
+
+    try:
+        resp = _client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt.strip()},
+                {"role": "user", "content": user_prompt.strip()},
+            ],
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=True,
+        )
+        return _stream_from(resp), model
+    except Exception:
+        for fb in ("gpt-4o-mini", "gpt-4o"):
+            try:
+                resp = _client.chat.completions.create(
+                    model=fb,
+                    messages=[
+                        {"role": "system", "content": system_prompt.strip()},
+                        {"role": "user", "content": user_prompt.strip()},
+                    ],
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    stream=True,
+                )
+                return _stream_from(resp), fb
+            except Exception:
+                continue
+        raise
