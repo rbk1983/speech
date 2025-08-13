@@ -1,13 +1,13 @@
 # app_llm.py
-# Kristalina Georgieva Speeches — RAG Console (with auto-index from ./uploads)
-# - Auto-index everything in ./uploads on app load (dedup by content digest)
+# Kristalina Georgieva Speeches — RAG Console (PKL-first corpus)
+# - Auto-ingest from ./speeches_data.pkl on first load (if present)
 # - Strict corpus-only toggle (air-gapped answers)
 # - Tabs: Results, Thematic Evolution, Rapid Response, Draft Assist, Corpus
-# - Upload/ingest additional speeches (TXT/MD/PDF/DOCX)
-# - View & delete items from corpus; re-scan uploads on demand
+# - Manual upload/ingest to extend corpus; delete by source_id
+# - Re-import from PKL on demand; dedupe by digest
 #
 # Setup:
-#   pip install streamlit openai pypdf python-docx
+#   pip install streamlit openai pypdf python-docx pandas
 #   export OPENAI_API_KEY=your_key_here
 # Run:
 #   streamlit run app_llm.py
@@ -16,6 +16,7 @@ import os
 import io
 import re
 import json
+import pickle
 import hashlib
 import unicodedata
 from datetime import datetime, date
@@ -53,7 +54,7 @@ EMBED_DIM = 1536  # for text-embedding-3-small
 DATA_DIR = os.environ.get("KG_DATA_DIR", "kg_speeches_store")
 INDEX_VEC = os.path.join(DATA_DIR, "embeddings.npy")
 INDEX_META = os.path.join(DATA_DIR, "metadata.json")
-UPLOADS_DIR = os.environ.get("KG_UPLOADS_DIR", "uploads")  # repo-local folder
+PKL_PATH = os.environ.get("KG_PKL_PATH", "speeches_data.pkl")  # main corpus file (if present)
 
 # -------- Utilities --------
 def ensure_store():
@@ -96,6 +97,9 @@ def chunk_text(text: str, max_tokens: int = 700, overlap_tokens: int = 100) -> L
         i = max(0, j - overlap)
     return chunks
 
+def digest_str(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
+
 def file_digest(name: str, data: bytes) -> str:
     h = hashlib.sha256()
     h.update(name.encode("utf-8"))
@@ -136,6 +140,7 @@ def try_parse_date_from_text(text: str) -> Optional[str]:
             pass
     return None
 
+# -------- Content readers --------
 def read_file_to_text(filename: str, data: bytes) -> str:
     name = filename.lower()
     if name.endswith((".txt", ".md")):
@@ -161,12 +166,13 @@ def read_file_to_text(filename: str, data: bytes) -> str:
             return ""
         d = docx.Document(io.BytesIO(data))
         return "\n".join(p.text for p in d.paragraphs)
-    # Fallback best-effort
+    # Fallback
     try:
         return data.decode("utf-8", errors="ignore")
     except Exception:
         return ""
 
+# -------- Embeddings --------
 def embed_texts(client: OpenAI, texts: List[str]) -> np.ndarray:
     if not OPENAI_OK:
         raise RuntimeError("OpenAI package not available. Install with `pip install openai`.")
@@ -187,106 +193,128 @@ def cosine_sim(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     b_norm = np.linalg.norm(b) + 1e-9
     return (a @ b) / (a_norm * b_norm)
 
-# -------- Indexing from ./uploads --------
-SUPPORTED_EXTS = (".txt", ".md", ".pdf", ".docx")
-
-def _list_upload_files() -> List[str]:
-    paths: List[str] = []
-    try:
-        for root, _, files in os.walk(UPLOADS_DIR):
-            for fn in files:
-                if fn.lower().endswith(SUPPORTED_EXTS):
-                    paths.append(os.path.join(root, fn))
-    except Exception:
-        pass
-    return sorted(paths)
-
-def _ingest_one_file(abs_path: str) -> Tuple[List[str], List[Dict[str, Any]]]:
-    texts: List[str] = []
-    metas: List[Dict[str, Any]] = []
-    try:
-        with open(abs_path, "rb") as f:
-            raw = f.read()
-        relname = os.path.relpath(abs_path, start=UPLOADS_DIR)
-        content = read_file_to_text(relname, raw)
-        if not content.strip():
-            return texts, metas
-        chunks = chunk_text(content)
-        if not chunks:
-            return texts, metas
-        digest = file_digest(relname, raw)
-        title_guess = os.path.splitext(os.path.basename(relname))[0].replace("_", " ").replace("-", " ").strip()
-        date_guess = try_parse_date_from_text(content) or try_parse_date_from_text(title_guess)
-
-        for i, ch in enumerate(chunks):
-            metas.append({
-                "id": f"{digest}:{i}",
-                "chunk_id": i,
-                "source_id": digest,
-                "source_name": relname,
-                "title": title_guess,
-                "date_iso": date_guess,
-                "text": ch,
-            })
-            texts.append(ch)
-    except Exception:
-        pass
-    return texts, metas
-
-def index_uploads(dry_run: bool = False) -> Dict[str, Any]:
+# -------- PKL ingestion --------
+def _iter_pkl_records(obj: Any) -> List[Dict[str, Any]]:
     """
-    Scan ./uploads and index any new/changed files (by digest).
-    Returns stats dict.
+    Normalize various PKL shapes to a list of dicts with keys: text, title?, date_iso?, source_name?
+    Accepts: list[dict], pandas.DataFrame, dict of lists, dict with 'records' key, etc.
     """
-    paths = _list_upload_files()
-    if not paths:
-        return {"files_scanned": 0, "new_files": 0, "new_chunks": 0}
+    records: List[Dict[str, Any]] = []
+    try:
+        import pandas as pd  # optional
+        is_pd = True
+    except Exception:
+        is_pd = False
+
+    # list of dicts
+    if isinstance(obj, list) and obj and isinstance(obj[0], dict):
+        return obj
+
+    # pandas DataFrame
+    if is_pd and "DataFrame" in str(type(obj)):
+        for _, row in obj.iterrows():  # type: ignore
+            d = {k: row[k] for k in row.keys()}
+            records.append({k: (None if d[k] is None else str(d[k])) for k in d})
+        return records
+
+    # dict of lists
+    if isinstance(obj, dict):
+        # if it has 'records' key
+        if "records" in obj and isinstance(obj["records"], list):
+            return obj["records"]
+        # align len and zip
+        keys = list(obj.keys())
+        if keys and isinstance(obj[keys[0]], list):
+            length = len(obj[keys[0]])
+            for i in range(length):
+                rec = {k: obj[k][i] if i < len(obj[k]) else None for k in keys}
+                records.append(rec)
+            return records
+
+    # fallback: wrap as single record
+    records = [obj] if isinstance(obj, dict) else []
+    return records
+
+def _build_doc_id(title: Optional[str], date_iso: Optional[str], text: str) -> str:
+    title_part = (title or "").strip()
+    date_part = (date_iso or "").strip()
+    key = f"{title_part}|{date_part}|{text.strip()[:5000]}"  # limit to first 5k chars for stability
+    return digest_str(key)
+
+def ingest_pkl(path: str) -> Dict[str, Any]:
+    if not os.path.isfile(path):
+        return {"loaded": False, "new_docs": 0, "new_chunks": 0}
+    with open(path, "rb") as f:
+        obj = pickle.load(f)
+    records = _iter_pkl_records(obj)
+    if not records:
+        return {"loaded": False, "new_docs": 0, "new_chunks": 0}
 
     vecs, meta = load_index()
     existing_ids = {m.get("source_id") for m in meta}
-    to_embed_texts: List[str] = []
-    to_embed_meta: List[Dict[str, Any]] = []
 
-    for p in paths:
-        # Peek digest; if unseen, ingest
-        try:
-            with open(p, "rb") as f:
-                raw = f.read()
-            relname = os.path.relpath(p, start=UPLOADS_DIR)
-            digest = file_digest(relname, raw)
-        except Exception:
+    to_texts: List[str] = []
+    to_meta: List[Dict[str, Any]] = []
+
+    for rec in records:
+        text = str(rec.get("text") or rec.get("content") or "").strip()
+        if not text:
             continue
-        if digest in existing_ids:
+        # normalize metadata
+        title = rec.get("title") or rec.get("headline") or rec.get("name") or ""
+        # Date could be 'date', 'date_iso', 'published', etc.
+        raw_date = (rec.get("date_iso") or rec.get("date") or rec.get("published") or "").strip()
+        iso = None
+        if raw_date:
+            # try to normalize common formats
+            try:
+                # If already YYYY-MM-DD
+                datetime.strptime(raw_date, "%Y-%m-%d")
+                iso = raw_date
+            except Exception:
+                # try parsing via simple heuristics
+                maybe = try_parse_date_from_text(raw_date)
+                if not maybe:
+                    maybe = try_parse_date_from_text(text[:400])
+                iso = maybe
+        else:
+            iso = try_parse_date_from_text(text[:400])
+
+        source_name = rec.get("source_name") or rec.get("source") or rec.get("file_name") or (title or "pkl_record")
+
+        doc_id = _build_doc_id(str(title), iso, text)
+        if doc_id in existing_ids:
             continue
-        t, m = _ingest_one_file(p)
-        to_embed_texts.extend(t)
-        to_embed_meta.extend(m)
 
-    stats = {"files_scanned": len(paths), "new_files": 0, "new_chunks": 0}
-    if not to_embed_texts:
-        return stats
+        # chunk + stage
+        chunks = chunk_text(text)
+        for i, ch in enumerate(chunks):
+            to_meta.append({
+                "id": f"{doc_id}:{i}",
+                "chunk_id": i,
+                "source_id": doc_id,
+                "source_name": str(source_name),
+                "title": str(title) if title is not None else None,
+                "date_iso": iso,
+                "text": ch,
+            })
+            to_texts.append(ch)
 
-    stats["new_files"] = len({m["source_id"] for m in to_embed_meta})
-    stats["new_chunks"] = len(to_embed_texts)
+    if not to_texts:
+        return {"loaded": True, "new_docs": 0, "new_chunks": 0}
 
-    if dry_run:
-        return stats
-
-    try:
-        client = OpenAI()
-        new_vecs = embed_texts(client, to_embed_texts)
-    except Exception as e:
-        raise RuntimeError(f"Embedding failed during uploads indexing: {e}")
+    client = OpenAI()
+    new_vecs = embed_texts(client, to_texts)
 
     if vecs.size == 0:
         merged_vecs = new_vecs
-        merged_meta = to_embed_meta
+        merged_meta = to_meta
     else:
         merged_vecs = np.vstack([vecs, new_vecs])
-        merged_meta = meta + to_embed_meta
+        merged_meta = meta + to_meta
 
     save_index(merged_vecs, merged_meta)
-    return stats
+    return {"loaded": True, "new_docs": len({m['source_id'] for m in to_meta}), "new_chunks": len(to_texts)}
 
 # -------- Retrieval --------
 def retrieve(query: str, k: int, score_threshold: float = 0.12,
@@ -404,21 +432,21 @@ def chat_blended(user_query: str, chunks: List[Dict[str, Any]]) -> str:
 st.set_page_config(page_title=APP_TITLE, page_icon="🗂️", layout="wide")
 st.title("🗂️ " + APP_TITLE)
 
-# Auto-index ./uploads exactly once per session (on first load)
-if "uploads_indexed_once" not in st.session_state:
-    st.session_state["uploads_indexed_once"] = True
-    if os.path.isdir(UPLOADS_DIR):
+# On first load: try ingesting from speeches_data.pkl
+if "pkl_ingested_once" not in st.session_state:
+    st.session_state["pkl_ingested_once"] = True
+    if os.path.isfile(PKL_PATH):
         try:
-            with st.spinner(f"Indexing new content from `./{UPLOADS_DIR}`…"):
-                stats = index_uploads(dry_run=False)
-            if stats["new_chunks"] > 0:
-                st.success(f"Indexed {stats['new_chunks']} new chunk(s) from {stats['new_files']} file(s) in `./{UPLOADS_DIR}`.")
+            with st.spinner(f"Ingesting corpus from `{PKL_PATH}`…"):
+                stats = ingest_pkl(PKL_PATH)
+            if stats.get("loaded"):
+                st.success(f"Corpus loaded. New docs: {stats['new_docs']}, new chunks: {stats['new_chunks']}.")
             else:
-                st.info(f"No new content found in `./{UPLOADS_DIR}`.")
+                st.info(f"No usable records found in `{PKL_PATH}`.")
         except Exception as e:
-            st.error(f"Auto-indexing failed: {e}")
+            st.error(f"PKL ingestion failed: {e}")
     else:
-        st.info(f"Uploads folder `./{UPLOADS_DIR}` not found. Create it to auto-index on load.")
+        st.info(f"No `{PKL_PATH}` found. You can upload content below and/or set KG_PKL_PATH.")
 
 with st.sidebar:
     st.header("Settings")
@@ -437,7 +465,7 @@ with st.sidebar:
     )
 
     st.markdown("---")
-    st.caption("Date range filter (optional, uses 'date_iso' from files if present):")
+    st.caption("Date range filter (optional, uses 'date_iso' from metadata):")
     c1, c2 = st.columns(2)
     with c1:
         start = st.date_input("Start", value=None)
@@ -702,16 +730,19 @@ with tab_corpus:
                 save_index(new_vecs, new_meta)
                 st.success(f"Deleted items with source_id in: {ids}. Re-run queries to use updated corpus.")
     else:
-        st.info("Corpus is empty. Add files via Uploads or ensure `./uploads` contains content and re-scan.")
+        st.info("Corpus is empty. Upload content or ingest from PKL.")
 
     st.markdown("---")
-    st.markdown("### Re-scan `./uploads`")
-    if st.button("Re-scan now"):
+    st.markdown(f"### Re-import from `{PKL_PATH}`")
+    if st.button("Import now"):
         try:
-            stats = index_uploads(dry_run=False)
-            st.success(f"Re-scan complete: {stats['new_chunks']} new chunk(s) from {stats['new_files']} file(s).")
+            stats = ingest_pkl(PKL_PATH)
+            if stats.get("loaded"):
+                st.success(f"Imported: {stats['new_docs']} new doc(s), {stats['new_chunks']} new chunk(s).")
+            else:
+                st.info("No records imported.")
         except Exception as e:
-            st.error(f"Re-scan failed: {e}")
+            st.error(f"Import failed: {e}")
 
 # ---- Manual Upload / Ingest ----
 st.divider()
@@ -735,7 +766,7 @@ if uploads:
             st.warning(f"No text chunks found: {f.name}")
             continue
 
-        # To align with auto-indexing, compute digest relative to an uploads path-style name
+        # In manual uploads, synthesize a stable source_id based on name+content digest
         relname = f"manual/{f.name}"
         digest = file_digest(relname, raw)
         title_guess = os.path.splitext(os.path.basename(f.name))[0].replace("_", " ").replace("-", " ").strip()
