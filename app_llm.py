@@ -1,804 +1,1053 @@
-# app_llm.py
-# Kristalina Georgieva Speeches — RAG Console (PKL-first corpus)
-# - Auto-ingest from ./speeches_data.pkl on first load (if present)
-# - Strict corpus-only toggle (air-gapped answers)
-# - Tabs: Results, Thematic Evolution, Rapid Response, Draft Assist, Corpus
-# - Manual upload/ingest to extend corpus; delete by source_id
-# - Re-import from PKL on demand; dedupe by digest
-#
-# Setup:
-#   pip install streamlit openai pypdf python-docx pandas
-#   export OPENAI_API_KEY=your_key_here
-# Run:
-#   streamlit run app_llm.py
-
-import os
-import io
-import re
-import json
-import pickle
-import hashlib
-import unicodedata
-from datetime import datetime, date
-from typing import List, Dict, Tuple, Any, Optional
-
-import numpy as np
+# app_llm.py — Ingest & Sync with YouTube/Vimeo fetch + Speaker filtering + Year-by-Year Evolution + Pagination
+import os, datetime as _dt, hashlib, math, json, re, tempfile, io
+from pathlib import Path
+import pandas as pd
 import streamlit as st
+import plotly.express as px
 
-# -------- OpenAI client --------
-try:
-    from openai import OpenAI
-    OPENAI_OK = True
-except Exception:
-    OPENAI_OK = False
-
-# -------- Optional parsers --------
-try:
-    from pypdf import PdfReader
-    HAS_PYPDF = True
-except Exception:
-    HAS_PYPDF = False
-
-try:
-    import docx  # python-docx
-    HAS_DOXC = True
-except Exception:
-    HAS_DOXC = False
-
-# -------- Config --------
-APP_TITLE = "Kristalina Georgieva Speeches — RAG"
-EMBED_MODEL = os.environ.get("EMBED_MODEL", "text-embedding-3-small")
-CHAT_MODEL = os.environ.get("CHAT_MODEL", "gpt-4o")
-EMBED_DIM = 1536  # for text-embedding-3-small
-
-DATA_DIR = os.environ.get("KG_DATA_DIR", "kg_speeches_store")
-INDEX_VEC = os.path.join(DATA_DIR, "embeddings.npy")
-INDEX_META = os.path.join(DATA_DIR, "metadata.json")
-PKL_PATH = os.environ.get("KG_PKL_PATH", "speeches_data.pkl")  # main corpus file (if present)
-
-# -------- Utilities --------
-def ensure_store():
-    os.makedirs(DATA_DIR, exist_ok=True)
-    if not os.path.exists(INDEX_VEC):
-        np.save(INDEX_VEC, np.zeros((0, EMBED_DIM), dtype=np.float32))
-    if not os.path.exists(INDEX_META):
-        with open(INDEX_META, "w", encoding="utf-8") as f:
-            json.dump([], f, ensure_ascii=False)
-
-def load_index() -> Tuple[np.ndarray, List[Dict[str, Any]]]:
-    ensure_store()
-    vecs = np.load(INDEX_VEC)
-    with open(INDEX_META, "r", encoding="utf-8") as f:
-        meta = json.load(f)
-    return vecs, meta
-
-def save_index(vecs: np.ndarray, meta: List[Dict[str, Any]]):
-    ensure_store()
-    np.save(INDEX_VEC, vecs.astype(np.float32))
-    with open(INDEX_META, "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
-
-def normalize_text(s: str) -> str:
-    return unicodedata.normalize("NFKC", s).replace("\r", "\n").strip()
-
-def chunk_text(text: str, max_tokens: int = 700, overlap_tokens: int = 100) -> List[str]:
-    # Approximate tokens with characters (~4 chars/token)
-    approx = max_tokens * 4
-    overlap = overlap_tokens * 4
-    t = normalize_text(text)
-    chunks, i, n = [], 0, len(t)
-    while i < n:
-        j = min(i + approx, n)
-        chunk = t[i:j].strip()
-        if chunk:
-            chunks.append(chunk)
-        if j == n:
-            break
-        i = max(0, j - overlap)
-    return chunks
-
-def digest_str(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
-
-def file_digest(name: str, data: bytes) -> str:
-    h = hashlib.sha256()
-    h.update(name.encode("utf-8"))
-    h.update(data)
-    return h.hexdigest()[:16]
-
-def try_parse_date_from_text(text: str) -> Optional[str]:
-    """
-    Try to find a date like 'January 12, 2024' or '2024-01-12' or '12 January 2024' in the text.
-    Returns ISO date 'YYYY-MM-DD' if found.
-    """
-    # ISO
-    m = re.search(r"(20\d{2})-(\d{2})-(\d{2})", text)
-    if m:
-        y, mo, d = m.groups()
-        try:
-            return str(date(int(y), int(mo), int(d)))
-        except Exception:
-            pass
-
-    # Month D, YYYY  or D Month YYYY
-    months = "(January|February|March|April|May|June|July|August|September|October|November|December)"
-    m = re.search(rf"{months}\s+(\d{{1,2}}),\s*(20\d{{2}})", text)
-    if m:
-        mon, d, y = m.groups()
-        try:
-            dt = datetime.strptime(f"{mon} {d} {y}", "%B %d %Y").date()
-            return str(dt)
-        except Exception:
-            pass
-    m = re.search(rf"(\d{{1,2}})\s+{months}\s+(20\d{{2}})", text)
-    if m:
-        d, mon, y = m.groups()
-        try:
-            dt = datetime.strptime(f"{d} {mon} {y}", "%d %B %Y").date()
-            return str(dt)
-        except Exception:
-            pass
-    return None
-
-# -------- Content readers --------
-def read_file_to_text(filename: str, data: bytes) -> str:
-    name = filename.lower()
-    if name.endswith((".txt", ".md")):
-        try:
-            return data.decode("utf-8", errors="ignore")
-        except Exception:
-            return data.decode("latin-1", errors="ignore")
-    if name.endswith(".pdf"):
-        if not HAS_PYPDF:
-            st.warning("`pypdf` not installed. Skipping PDF. Run: pip install pypdf")
-            return ""
-        text = []
-        reader = PdfReader(io.BytesIO(data))
-        for page in reader.pages:
-            try:
-                text.append(page.extract_text() or "")
-            except Exception:
-                pass
-        return "\n".join(text)
-    if name.endswith(".docx"):
-        if not HAS_DOXC:
-            st.warning("`python-docx` not installed. Skipping DOCX. Run: pip install python-docx")
-            return ""
-        d = docx.Document(io.BytesIO(data))
-        return "\n".join(p.text for p in d.paragraphs)
-    # Fallback
-    try:
-        return data.decode("utf-8", errors="ignore")
-    except Exception:
-        return ""
-
-# -------- Embeddings --------
-def embed_texts(client: OpenAI, texts: List[str]) -> np.ndarray:
-    if not OPENAI_OK:
-        raise RuntimeError("OpenAI package not available. Install with `pip install openai`.")
-    if not os.environ.get("OPENAI_API_KEY"):
-        raise RuntimeError("OPENAI_API_KEY not set.")
-    embs = []
-    B = 64
-    for i in range(0, len(texts), B):
-        batch = texts[i:i + B]
-        resp = client.embeddings.create(model=EMBED_MODEL, input=batch)
-        embs.extend([np.array(d.embedding, dtype=np.float32) for d in resp.data])
-    return np.vstack(embs) if embs else np.zeros((0, EMBED_DIM), dtype=np.float32)
-
-def cosine_sim(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    if a.size == 0:
-        return np.array([])
-    a_norm = np.linalg.norm(a, axis=1) + 1e-9
-    b_norm = np.linalg.norm(b) + 1e-9
-    return (a @ b) / (a_norm * b_norm)
-
-# -------- PKL ingestion --------
-def _iter_pkl_records(obj: Any) -> List[Dict[str, Any]]:
-    """
-    Normalize various PKL shapes to a list of dicts with keys: text, title?, date_iso?, source_name?
-    Accepts: list[dict], pandas.DataFrame, dict of lists, dict with 'records' key, etc.
-    """
-    records: List[Dict[str, Any]] = []
-    try:
-        import pandas as pd  # optional
-        is_pd = True
-    except Exception:
-        is_pd = False
-
-    # list of dicts
-    if isinstance(obj, list) and obj and isinstance(obj[0], dict):
-        return obj
-
-    # pandas DataFrame
-    if is_pd and "DataFrame" in str(type(obj)):
-        for _, row in obj.iterrows():  # type: ignore
-            d = {k: row[k] for k in row.keys()}
-            records.append({k: (None if d[k] is None else str(d[k])) for k in d})
-        return records
-
-    # dict of lists
-    if isinstance(obj, dict):
-        # if it has 'records' key
-        if "records" in obj and isinstance(obj["records"], list):
-            return obj["records"]
-        # align len and zip
-        keys = list(obj.keys())
-        if keys and isinstance(obj[keys[0]], list):
-            length = len(obj[keys[0]])
-            for i in range(length):
-                rec = {k: obj[k][i] if i < len(obj[k]) else None for k in keys}
-                records.append(rec)
-            return records
-
-    # fallback: wrap as single record
-    records = [obj] if isinstance(obj, dict) else []
-    return records
-
-def _build_doc_id(title: Optional[str], date_iso: Optional[str], text: str) -> str:
-    title_part = (title or "").strip()
-    date_part = (date_iso or "").strip()
-    key = f"{title_part}|{date_part}|{text.strip()[:5000]}"  # limit to first 5k chars for stability
-    return digest_str(key)
-
-def ingest_pkl(path: str) -> Dict[str, Any]:
-    if not os.path.isfile(path):
-        return {"loaded": False, "new_docs": 0, "new_chunks": 0}
-    with open(path, "rb") as f:
-        obj = pickle.load(f)
-    records = _iter_pkl_records(obj)
-    if not records:
-        return {"loaded": False, "new_docs": 0, "new_chunks": 0}
-
-    vecs, meta = load_index()
-    existing_ids = {m.get("source_id") for m in meta}
-
-    to_texts: List[str] = []
-    to_meta: List[Dict[str, Any]] = []
-
-    for rec in records:
-        text = str(rec.get("text") or rec.get("content") or "").strip()
-        if not text:
-            continue
-        # normalize metadata
-        title = rec.get("title") or rec.get("headline") or rec.get("name") or ""
-        # Date could be 'date', 'date_iso', 'published', etc.
-        raw_date = (rec.get("date_iso") or rec.get("date") or rec.get("published") or "").strip()
-        iso = None
-        if raw_date:
-            # try to normalize common formats
-            try:
-                # If already YYYY-MM-DD
-                datetime.strptime(raw_date, "%Y-%m-%d")
-                iso = raw_date
-            except Exception:
-                # try parsing via simple heuristics
-                maybe = try_parse_date_from_text(raw_date)
-                if not maybe:
-                    maybe = try_parse_date_from_text(text[:400])
-                iso = maybe
-        else:
-            iso = try_parse_date_from_text(text[:400])
-
-        source_name = rec.get("source_name") or rec.get("source") or rec.get("file_name") or (title or "pkl_record")
-
-        doc_id = _build_doc_id(str(title), iso, text)
-        if doc_id in existing_ids:
-            continue
-
-        # chunk + stage
-        chunks = chunk_text(text)
-        for i, ch in enumerate(chunks):
-            to_meta.append({
-                "id": f"{doc_id}:{i}",
-                "chunk_id": i,
-                "source_id": doc_id,
-                "source_name": str(source_name),
-                "title": str(title) if title is not None else None,
-                "date_iso": iso,
-                "text": ch,
-            })
-            to_texts.append(ch)
-
-    if not to_texts:
-        return {"loaded": True, "new_docs": 0, "new_chunks": 0}
-
-    client = OpenAI()
-    new_vecs = embed_texts(client, to_texts)
-
-    if vecs.size == 0:
-        merged_vecs = new_vecs
-        merged_meta = to_meta
-    else:
-        merged_vecs = np.vstack([vecs, new_vecs])
-        merged_meta = meta + to_meta
-
-    save_index(merged_vecs, merged_meta)
-    return {"loaded": True, "new_docs": len({m['source_id'] for m in to_meta}), "new_chunks": len(to_texts)}
-
-# -------- Retrieval --------
-def retrieve(query: str, k: int, score_threshold: float = 0.12,
-             start_date: Optional[date] = None, end_date: Optional[date] = None) -> List[Dict[str, Any]]:
-    vecs, meta = load_index()
-    if vecs.size == 0 or not meta:
-        return []
-    client = OpenAI()
-    q_vec = embed_texts(client, [query])[0]
-    sims = cosine_sim(vecs, q_vec)
-    order = np.argsort(-sims)  # high to low similarity
-
-    # Build results with optional date filtering
-    results: List[Dict[str, Any]] = []
-    for i in order[: max(k * 5, k)]:  # oversample then threshold
-        score = float(sims[i])
-        if score < score_threshold:
-            continue
-        m = meta[i].copy()
-        # date filter: parse item date if present
-        iso = m.get("date_iso")
-        if iso:
-            try:
-                d = datetime.strptime(iso, "%Y-%m-%d").date()
-                if start_date and d < start_date:
-                    continue
-                if end_date and d > end_date:
-                    continue
-            except Exception:
-                pass
-        m["score"] = score
-        results.append(m)
-
-    # Sort newest first when dates are available
-    def _key(x):
-        iso = x.get("date_iso")
-        try:
-            return datetime.strptime(iso, "%Y-%m-%d")
-        except Exception:
-            return datetime.min
-    results.sort(key=_key, reverse=True)
-    return results[:k]
-
-def _fmt_src(item: Dict[str, Any]) -> str:
-    return (
-        item.get("source_name")
-        or item.get("source")
-        or item.get("file_name")
-        or item.get("doc_name")
-        or "unknown"
-    )
-
-def _fmt_chunk_id(item: Dict[str, Any]) -> str:
-    return str(item.get("chunk_id", item.get("id", "?")))
-
-def _fmt_text(item: Dict[str, Any]) -> str:
-    return (item.get("text") or item.get("content") or "").strip()
-
-def _has_context(s: Optional[str]) -> bool:
-    return bool(s and isinstance(s, str) and s.strip())
-
-def _format_context_blocks(chunks: List[Dict[str, Any]]) -> str:
-    blocks = []
-    for c in chunks:
-        header = []
-        if c.get("date_iso"):
-            header.append(c["date_iso"])
-        if c.get("title"):
-            header.append(c["title"])
-        head = " — ".join(header) if header else f"{_fmt_src(c)} | chunk {_fmt_chunk_id(c)}"
-        blocks.append(f"[{head}]\n{_fmt_text(c)}")
-    return "\n\n---\n\n".join(blocks)
-
-# -------- Chat helpers --------
-def chat_strict(user_query: str, chunks: List[Dict[str, Any]]) -> str:
-    if not chunks:
-        return "Not found in corpus."
-    if not OPENAI_OK or not os.environ.get("OPENAI_API_KEY"):
-        return "Error: OpenAI unavailable or API key not set."
-    client = OpenAI()
-    system_msg = (
-        "You are a meticulous IMF speech analyst. "
-        "Answer the user's question using ONLY the provided context blocks. "
-        "If the answer is not fully supported by the context, reply exactly: Not found in corpus."
-    )
-    content = f"Context:\n\n{_format_context_blocks(chunks)}\n\n---\n\nQuestion: {user_query}"
-    resp = client.chat.completions.create(
-        model=CHAT_MODEL,
-        messages=[{"role": "system", "content": system_msg},
-                  {"role": "user", "content": content}],
-        temperature=0.0,
-    )
-    return (resp.choices[0].message.content or "").strip()
-
-def chat_blended(user_query: str, chunks: List[Dict[str, Any]]) -> str:
-    if not OPENAI_OK or not os.environ.get("OPENAI_API_KEY"):
-        return "Error: OpenAI unavailable or API key not set."
-    client = OpenAI()
-    system_msg = (
-        "You are a helpful communications analyst. "
-        "Use the provided context when relevant, but you may use your broader knowledge. "
-        "When you rely on the context, cite the date and title in parentheses."
-    )
-    context = _format_context_blocks(chunks) if chunks else "(no retrieved context)"
-    content = f"Context (may be partial):\n\n{context}\n\n---\n\nQuestion: {user_query}"
-    resp = client.chat.completions.create(
-        model=CHAT_MODEL,
-        messages=[{"role": "system", "content": system_msg},
-                  {"role": "user", "content": content}],
-        temperature=0.2,
-    )
-    return (resp.choices[0].message.content or "").strip()
-
-# -------- Streamlit UI --------
-st.set_page_config(page_title=APP_TITLE, page_icon="🗂️", layout="wide")
-st.title("🗂️ " + APP_TITLE)
-
-# On first load: try ingesting from speeches_data.pkl
-if "pkl_ingested_once" not in st.session_state:
-    st.session_state["pkl_ingested_once"] = True
-    if os.path.isfile(PKL_PATH):
-        try:
-            with st.spinner(f"Ingesting corpus from `{PKL_PATH}`…"):
-                stats = ingest_pkl(PKL_PATH)
-            if stats.get("loaded"):
-                st.success(f"Corpus loaded. New docs: {stats['new_docs']}, new chunks: {stats['new_chunks']}.")
-            else:
-                st.info(f"No usable records found in `{PKL_PATH}`.")
-        except Exception as e:
-            st.error(f"PKL ingestion failed: {e}")
-    else:
-        st.info(f"No `{PKL_PATH}` found. You can upload content below and/or set KG_PKL_PATH.")
-
-with st.sidebar:
-    st.header("Settings")
-    strict_mode = st.toggle(
-        "Strict corpus-only mode",
-        value=True,
-        help=("ON: Answer ONLY from retrieved speech excerpts. "
-              "If nothing is relevant, returns 'Not found in corpus.'\n"
-              "OFF: Model may use its general knowledge in addition to context.")
-    )
-    top_k = st.slider("Top-K chunks per query", 1, 20, 8, 1)
-    score_threshold = st.slider(
-        "Min similarity (retrieval filter)",
-        0.00, 0.50, 0.12, 0.01,
-        help="Raise to be more conservative (fewer but surer matches)."
-    )
-
-    st.markdown("---")
-    st.caption("Date range filter (optional, uses 'date_iso' from metadata):")
-    c1, c2 = st.columns(2)
-    with c1:
-        start = st.date_input("Start", value=None)
-    with c2:
-        end = st.date_input("End", value=None)
-
-# ---- Tabs ----
-tab_results, tab_evolution, tab_rr, tab_draft, tab_corpus = st.tabs(
-    ["Results", "Thematic Evolution", "Rapid Response", "Draft Assist", "Corpus"]
+# --- Utilities with safe fallback for `llm_stream` ---
+from rag_utils import (
+    load_df, load_index,
+    retrieve_speeches, sources_from_speeches,
+    format_hits_for_context, llm
 )
 
-# ===== Results Tab =====
-with tab_results:
-    st.subheader("🔎 Query Speeches")
-    query = st.text_input("Ask a question (summaries, talking points, citations, etc.)", key="q_results")
-    col_a, col_b = st.columns([1, 2])
-    with col_a:
-        run = st.button("Run", type="primary", key="run_results")
-    with col_b:
-        show_ctx = st.checkbox("Show retrieved context", value=True, key="show_ctx_results")
+# Optional helpers that may or may not exist in your environment
+try:
+    from rag_utils import whisper_transcribe  # optional convenience
+except Exception:
+    whisper_transcribe = None
 
-    if run and query.strip():
-        with st.spinner("Retrieving..."):
-            results = retrieve(query=query, k=top_k, score_threshold=score_threshold,
-                               start_date=start, end_date=end)
+try:
+    from build_index import main as build_index_main
+except Exception:
+    build_index_main = None
 
-        # Viewer
-        st.markdown(f"**Retrieved {len(results)} chunk(s)**")
-        if show_ctx:
-            with st.expander("View retrieved chunks"):
-                for r in results:
-                    src = _fmt_src(r)
-                    cid = _fmt_chunk_id(r)
-                    score = r.get("score", None)
-                    score_txt = f" — score {score:.3f}" if isinstance(score, (int, float)) else ""
-                    date_s = r.get("date_iso") or "Unknown date"
-                    title = r.get("title") or src
-                    preview = _fmt_text(r)[:1000]
-                    more = "…" if len(_fmt_text(r)) > 1000 else ""
-                    st.markdown(f"**{date_s} — {title}** ({src} — chunk {cid}{score_txt})\n\n{preview}{more}")
-                    st.markdown("---")
+try:
+    import git  # GitPython (optional)
+except Exception:
+    git = None
 
-        # Strict mode hard-stop if no results
-        if run:
-            if strict_mode and not results:
-                st.markdown("### 🧠 Answer")
-                st.code("Not found in corpus.")
-            elif run:
-                # Build chat messages and answer
-                with st.spinner("Generating answer..."):
-                    answer = chat_strict(query, results) if strict_mode else chat_blended(query, results)
+try:
+    import docx2txt  # optional for .docx -> text
+except Exception:
+    docx2txt = None
 
-                st.markdown("### 🧠 Answer")
-                if strict_mode and answer.strip().lower() == "not found in corpus.":
-                    st.code("Not found in corpus.")
-                else:
-                    st.write(answer)
+try:
+    import pdfminer.high_level as pdfminer_high  # optional for .pdf -> text
+except Exception:
+    pdfminer_high = None
 
-# ===== Thematic Evolution Tab =====
-with tab_evolution:
-    st.subheader("📈 Thematic Evolution")
-    theme_q = st.text_input("Theme or query (e.g., 'climate finance', 'debt restructuring')", key="q_evol")
-    run_e = st.button("Analyze", key="run_evol")
-    if run_e and theme_q.strip():
-        with st.spinner("Retrieving theme-related context..."):
-            hits = retrieve(query=theme_q, k=max(20, top_k), score_threshold=score_threshold,
-                            start_date=start, end_date=end)
+try:
+    from bs4 import BeautifulSoup  # optional for .html -> text
+except Exception:
+    BeautifulSoup = None
 
-        full_ctx = _format_context_blocks(hits)
+# yt-dlp for YouTube/Vimeo/audio fetch
+try:
+    import yt_dlp  # type: ignore
+    _YTDLP_OK = True
+except Exception:
+    yt_dlp = None
+    _YTDLP_OK = False
 
-        if strict_mode and not _has_context(full_ctx):
-            st.warning("No matching context; Strict mode is active.")
+# Optional: diarization + speaker embedding
+try:
+    from pyannote.audio import Pipeline as _PyannotePipeline  # type: ignore
+    _PYANNOTE_OK = True
+except Exception:
+    _PyannotePipeline = None
+    _PYANNOTE_OK = False
+
+try:
+    import torch  # type: ignore
+    from speechbrain.pretrained import EncoderClassifier  # type: ignore
+    _SB_OK = True
+except Exception:
+    EncoderClassifier = None
+    _SB_OK = False
+
+# OpenAI Whisper fallback for transcription with timestamps
+try:
+    from openai import OpenAI
+    _OPENAI_OK = True
+except Exception:
+    _OPENAI_OK = False
+
+def _safe_slug(s: str) -> str:
+    s = re.sub(r'[^A-Za-z0-9._-]+', '_', s).strip('_')
+    return s or "unnamed"
+
+def _now_iso():
+    return _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+# Whisper transcription using either helper or OpenAI API (returns text and optional segments)
+def transcribe_bytes(file_bytes: bytes, filename: str):
+    """Return dict: {'text': str, 'segments': list|None}"""
+    if whisper_transcribe:
+        try:
+            text = whisper_transcribe(file_bytes, filename)
+            return {"text": text, "segments": None}
+        except Exception as e:
+            raise RuntimeError(f"whisper_transcribe failed: {e}")
+    if not _OPENAI_OK or not os.getenv("OPENAI_API_KEY"):
+        raise RuntimeError("Transcription unavailable: set OPENAI_API_KEY or add a whisper_transcribe helper.")
+    client = OpenAI()
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        tmp.write(file_bytes)
+        tmp.flush()
+        tmp_name = tmp.name
+    try:
+        with open(tmp_name, "rb") as f:
+            resp = client.audio.transcriptions.create(model="whisper-1", file=f, response_format="verbose_json")
+        text = getattr(resp, "text", None) or (resp.get("text") if isinstance(resp, dict) else None)
+        segments = getattr(resp, "segments", None) or (resp.get("segments") if isinstance(resp, dict) else None)
+        return {"text": text or "", "segments": segments}
+    finally:
+        try: os.remove(tmp_name)
+        except Exception: pass
+
+def doc_to_text(path: Path) -> str:
+    """Convert supported docs to raw text."""
+    suffix = path.suffix.lower()
+    if suffix in (".txt", ".md"):
+        return path.read_text(encoding="utf-8", errors="ignore")
+    if suffix == ".docx":
+        if not docx2txt:
+            raise RuntimeError("docx2txt not installed; cannot parse .docx.")
+        return docx2txt.process(str(path)) or ""
+    if suffix == ".pdf":
+        if not pdfminer_high:
+            raise RuntimeError("pdfminer.six not installed; cannot parse .pdf.")
+        return pdfminer_high.extract_text(str(path)) or ""
+    if suffix in (".html", ".htm"):
+        if not BeautifulSoup:
+            raise RuntimeError("bs4 not installed; cannot parse .html.")
+        html = path.read_text(encoding="utf-8", errors="ignore")
+        soup = BeautifulSoup(html, "html.parser")
+        return soup.get_text(separator="\n")
+    raise RuntimeError(f"Unsupported document type: {suffix}")
+
+def ytdlp_fetch_audio(url: str, out_dir: Path, *, cookies_bytes: bytes | None = None, proxy: str | None = None) -> dict:
+    \"\"\"Download best audio from a URL (YouTube/Vimeo/etc.) using yt-dlp.
+    Returns {'path': Path, 'title': str, 'ext': str, 'uploader': str, 'upload_date': 'YYYYMMDD'}
+    \"\"\"
+    if not _YTDLP_OK:
+        raise RuntimeError("yt-dlp not installed. Install with: pip install yt-dlp")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    cookiefile = None
+    if cookies_bytes:
+        import tempfile
+        cf = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
+        cf.write(cookies_bytes)
+        cf.flush()
+        cookiefile = cf.name
+
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": str(out_dir / "%(title).200B.%(ext)s"),
+        "noprogress": True,
+        "quiet": True,
+        "geo_bypass": True,
+        "nocheckcertificate": True,
+        "restrictfilenames": False,
+        "ignoreerrors": False,
+        "postprocessors": [
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
+        ],
+        # Harden against transient errors / throttling
+        "retries": 10,
+        "fragment_retries": 10,
+        "concurrent_fragment_downloads": 1,
+        # Try alternate player clients (helps with some 403s)
+        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+    }
+    if cookiefile:
+        ydl_opts["cookiefile"] = cookiefile
+    if proxy:
+        ydl_opts["proxy"] = proxy
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        if info is None:
+            raise RuntimeError("yt-dlp failed to extract media info.")
+        if "entries" in info and info["entries"]:
+            info = next((e for e in info["entries"] if e), None)
+            if info is None:
+                raise RuntimeError("No playable entries in playlist.")
+        title = info.get("title") or "audio"
+        upload_date = info.get("upload_date")  # YYYYMMDD
+        uploader = info.get("uploader") or info.get("channel")
+        # locate resulting mp3
+        candidates = list(out_dir.glob(f"{title}*.mp3"))
+        if not candidates:
+            candidates = sorted(out_dir.glob("*.mp3"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not candidates:
+            raise RuntimeError("Audio file not found after download.")
+        path = candidates[0]
+        return {"path": path, "title": title, "ext": path.suffix.lstrip("."), "uploader": uploader, "upload_date": upload_date}
+
+# ----- Speaker filtering helpers (optional) -----
+def _load_diarization_pipeline():
+    """Load pyannote diarization with HF token if available."""
+    if not _PYANNOTE_OK:
+        raise RuntimeError("pyannote.audio not installed. pip install pyannote.audio")
+    hf_token = os.getenv("HUGGINGFACE_TOKEN") or os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
+    if not hf_token:
+        raise RuntimeError("Set HUGGINGFACE_TOKEN to use diarization (pyannote/speaker-diarization).")
+    pipeline = _PyannotePipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=hf_token)
+    return pipeline
+
+def _load_spk_encoder():
+    if not _SB_OK:
+        raise RuntimeError("speechbrain not installed. pip install speechbrain torch")
+    enc = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb")
+    return enc
+
+def _wav_bytes_from_path(path: Path) -> bytes:
+    # yt-dlp produced mp3; speechbrain handles multiple formats via torchaudio backend
+    with open(path, "rb") as f:
+        return f.read()
+
+def _speaker_embed(encoder, wav_path: Path):
+    import torchaudio  # type: ignore
+    signal, sr = torchaudio.load(str(wav_path))
+    if signal.shape[0] > 1:
+        signal = signal.mean(dim=0, keepdim=True)
+    emb = encoder.encode_batch(signal)
+    return emb.squeeze().detach().cpu()
+
+def diarize_and_filter_audio(audio_path: Path, transcript, ref_audio_file) -> dict:
+    """Return {'text': str, 'segments': list|None} filtered to the speaker most similar to ref audio.
+       transcript is dict from transcribe_bytes (needs 'segments' with timestamps).
+    """
+    # Ensure we have segments with timestamps
+    segments = transcript.get("segments")
+    if not segments:
+        raise RuntimeError("Transcript lacks timestamps; cannot align segments to speakers. Use Whisper with 'verbose_json'.")
+
+    # Diarize
+    pipeline = _load_diarization_pipeline()
+    diar = pipeline(str(audio_path))
+    # Build speaker->time windows
+    spk_windows = {}
+    for turn, _, speaker in diar.itertracks(yield_label=True):
+        spk_windows.setdefault(speaker, []).append((turn.start, turn.end))
+
+    # Build reference embedding
+    encoder = _load_spk_encoder()
+    # Save reference bytes to temp file to pass through torchaudio
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as t:
+        t.write(ref_audio_file.getvalue())
+        ref_path = Path(t.name)
+    try:
+        ref_emb = _speaker_embed(encoder, ref_path)
+    finally:
+        try: os.remove(ref_path)
+        except Exception: pass
+
+    # For each diarized speaker, compute embedding by pooling segments (first N seconds)
+    import torchaudio  # type: ignore
+    sims = {}
+    for spk, wins in spk_windows.items():
+        # Extract up to ~30 seconds for embedding
+        # Load full file once
+        waveform, sr = torchaudio.load(str(audio_path))
+        if waveform.shape[0] > 1: waveform = waveform.mean(dim=0, keepdim=True)
+        # Collate samples from windows
+        total = int(sr * 30)
+        chunks = []
+        acc = 0
+        for (s,e) in wins:
+            s_i = max(0, int(s * sr)); e_i = min(waveform.shape[-1], int(e * sr))
+            if e_i > s_i:
+                seg = waveform[:, s_i:e_i]
+                chunks.append(seg)
+                acc += seg.shape[-1]
+                if acc >= total: break
+        if not chunks: continue
+        pooled = torch.cat(chunks, dim=1)
+        # Temp save pooled to file-like for encoder reuse
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmpw:
+            torchaudio.save(tmpw.name, pooled, sr)
+            spk_emb = _speaker_embed(encoder, Path(tmpw.name))
+        # cosine similarity
+        cos = torch.nn.functional.cosine_similarity(ref_emb.unsqueeze(0), spk_emb.unsqueeze(0)).item()
+        sims[spk] = cos
+
+    if not sims:
+        raise RuntimeError("Could not compute speaker similarities; check audio quality and dependencies.")
+
+    # Pick best-matching diarized speaker
+    target_spk = max(sims, key=sims.get)
+
+    # Filter transcript segments whose midpoint falls inside target speaker windows
+    def midpoint(seg):
+        start = float(seg.get("start", 0))
+        end = float(seg.get("end", start))
+        return (start + end) / 2.0
+
+    def in_windows(t, windows):
+        for (s, e) in windows:
+            if s <= t <= e:
+                return True
+        return False
+
+    target_windows = spk_windows[target_spk]
+    kept = [seg for seg in segments if in_windows(midpoint(seg), target_windows)]
+    text = " ".join([seg.get("text","") for seg in kept]).strip()
+    return {"text": text, "segments": kept}
+
+# ----- Defaults (kept simple) -----
+PER_ITEM_TOKENS = 400   # Longer = richer bullets/snippets; shorter = terser (cheaper)
+DEFAULT_MODEL   = "gpt-4o-mini"
+
+# Cache for LLM results
+_LLM_CACHE = {}
+def llm_cached(key, system_prompt, user_prompt, *, model=DEFAULT_MODEL,
+               max_tokens=PER_ITEM_TOKENS, temperature=0.3, stream=False):
+    from rag_utils import llm as _llm
+    try:
+        from rag_utils import llm_stream  # type: ignore
+    except Exception:
+        llm_stream = None
+
+    if key in _LLM_CACHE:
+        text, used_model = _LLM_CACHE[key]
+        if stream:
+            st.markdown(text)
+        return text, used_model
+    if stream and llm_stream:
+        gen, used_model = llm_stream(system_prompt, user_prompt,
+                                     model=model, max_tokens=max_tokens,
+                                     temperature=temperature)
+        text = st.write_stream(gen)
+        out = (text, used_model)
+    else:
+        try:
+            text = _llm(system_prompt, user_prompt, model=model,
+                        max_tokens=max_tokens, temperature=temperature)
+            out = (text, model)
+        except Exception:
+            fallback = DEFAULT_MODEL
+            text = _llm(system_prompt, user_prompt, model=fallback,
+                        max_tokens=max_tokens, temperature=temperature)
+            out = (text, fallback)
+    _LLM_CACHE[key] = out
+    return out
+
+# Phase 3 utils (optional)
+try:
+    from phase3_utils import (
+        build_issue_trajectory, forecast_issue_trends, trajectory_narrative
+    )
+    _HAS_P3 = True
+except Exception:
+    _HAS_P3 = False
+
+st.set_page_config(page_title="Kristalina Speech Intelligence (LLM)", layout="wide")
+
+# ---------------- Styling (Sticky top bar) ----------------
+st.markdown("""
+<style>
+.sticky-bar{
+  position: sticky; top: 0; z-index: 999;
+  padding: .5rem .25rem .6rem .25rem;
+  background: white;
+  border-bottom: 1px solid rgba(0,0,0,.08);
+}
+.card{
+  border: 1px solid rgba(0,0,0,.08);
+  padding: .75rem 1rem; border-radius: 12px; margin-bottom: .75rem;
+  background: #ffffff;
+  box-shadow: 0 1px 4px rgba(0,0,0,.04);
+}
+.card h4{ margin: 0 0 .25rem 0; }
+.small { font-size: 0.9rem; color: #666; }
+code { background: rgba(0,0,0,.04); padding: 0 .25rem; border-radius: 4px; }
+</style>
+""", unsafe_allow_html=True)
+
+st.title("Kristalina Georgieva — Speech Intelligence")
+
+# ---------------- Robust loaders with clearer errors ----------------
+def _index_files_present():
+    return all(os.path.exists(p) for p in ["index.faiss", "meta.json", "chunks.json"])
+
+def _ensure_index():
+    if _index_files_present():
+        return True
+    st.warning("Search index not found. You can build it here once.")
+    if not os.getenv("OPENAI_API_KEY"):
+        st.error("Missing OpenAI API key. Add it to Streamlit secrets, then rerun."); st.stop()
+    if st.button("Build index now"):
+        with st.spinner("Building index…"):
+            try:
+                from build_index import main as build_index_main_local
+                build_index_main_local()
+                st.success("Index built. Click **Rerun** or refresh."); st.stop()
+            except Exception as e:
+                st.error(f"Index build failed: {e}")
+                st.stop()
+
+_ensure_index()
+
+try:
+    df = load_df()
+except Exception as e:
+    st.error(f"Failed to load metadata dataframe: {e}")
+    st.stop()
+
+try:
+    index, metas, chunks = load_index()
+except Exception as e:
+    st.error(f"Failed to load search index: {e}")
+    st.stop()
+
+# ---------------- Sticky Top Bar ----------------
+with st.container():
+    st.markdown('<div class="sticky-bar">', unsafe_allow_html=True)
+    top_c1, top_c2, top_c3, top_c4 = st.columns([2.2, 2.2, 1.2, 1.2])
+    with top_c1:
+        query = st.text_input("Search speeches", "", placeholder="e.g., climate finance, inflation, Ukraine")
+    with top_c2:
+        # Date range
+        try:
+            min_date = pd.to_datetime(df["date"], errors="coerce").dropna().min().date()
+            max_date = pd.to_datetime(df["date"], errors="coerce").dropna().max().date()
+        except Exception:
+            min_date = _dt.date(2000,1,1)
+            max_date = _dt.date.today()
+        date_from = st.date_input("From", min_date, key="from")
+        date_to = st.date_input("To", max_date, key="to")
+    with top_c3:
+        sort = st.selectbox("Sort", ["Newest", "Relevance"], index=0)
+        layout_mode = st.selectbox("Layout", ["Dense list", "Compact cards"], index=1)
+    with top_c4:
+        exact_phrase = st.toggle("Exact phrase", value=True, help="Match the exact phrase; reduces noise for multi-word queries.")
+        high_precision = st.toggle("High precision ranking", value=True, help="Better ranking via dense retrieval + reranking + diversity controls.")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+st.caption("Mode: **Depth** — returns fewer items per step but with richer context for better summaries.")
+
+# Advanced (collapsed)
+with st.expander("Advanced settings", expanded=False):
+    strictness = st.slider("Strictness", 0.0, 1.0, 0.6, 0.05,
+                           help="Higher = tighter match to your query; lower = looser, more exploratory.")
+    core_topic_only = st.toggle("Core topic only", value=False,
+                                help="Show speeches where the query is a central theme (not just a passing mention).")
+    model_preferred = st.selectbox("Model", ["gpt-4o-mini", "gpt-4o"], index=0)
+
+filters = {"date_from": date_from, "date_to": date_to}
+sort_key = "newest" if sort == "Newest" else "relevance"
+
+def _parse_date(meta_date):
+    try:
+        return pd.to_datetime(str(meta_date), errors="coerce")
+    except Exception:
+        return pd.NaT
+
+def _enforce_newest_first(items):
+    return sorted(items, key=lambda sp: _parse_date(sp["meta"].get("date")), reverse=True)
+
+# Session state for pagination
+if "page" not in st.session_state:
+    st.session_state.page = 1
+
+def reset_pagination():
+    st.session_state.page = 1
+
+speeches, total_before = [], 0
+if query and query.strip():
+    fp = f"{query}|{date_from}|{date_to}|{sort_key}|{exact_phrase}|{high_precision}|{core_topic_only}|{strictness}"
+    if st.session_state.get("fp") != fp:
+        st.session_state.fp = fp
+        reset_pagination()
+    try:
+        speeches, total_before = retrieve_speeches(
+            query=query,
+            index=index, metas=metas, chunks=chunks,
+            filters=filters,
+            sort=sort_key,
+            precision=high_precision,
+            strictness=strictness,
+            exact_phrase=exact_phrase,
+            exclude_terms=[],
+            core_topic_only=core_topic_only,
+            use_llm_rerank=True,
+            model=model_preferred
+        )
+    except Exception as e:
+        st.error(f"Search failed: {e}")
+        speeches = []
+
+    if speeches:
+        if sort_key == "newest":
+            speeches = _enforce_newest_first(speeches)
+
+        st.caption(f"Matched speeches: {len(speeches)} (from {total_before} initial candidates).")
+    else:
+        st.info("No results. Try loosening strictness or widening the date range.")
+
+else:
+    st.info("Enter a search term above to explore speeches.")
+
+# ---------------- Tabs ----------------
+tabs = ["Results", "Thematic Evolution", "Briefing Pack", "Rapid Response", "Draft Assist", "Ingest & Sync"]
+try:
+    from phase3_utils import build_issue_trajectory  # check existence
+    tabs.insert(3, "Trajectory")
+    _HAS_P3 = True
+except Exception:
+    _HAS_P3 = False
+
+tab_objs = st.tabs(tabs)
+
+# Map tabs
+tab_res  = tab_objs[0]
+tab_comp = tab_objs[1]
+tab_brief = tab_objs[2]
+offset = 0
+if _HAS_P3:
+    tab_traj = tab_objs[3]; offset = 1
+tab_rr   = tab_objs[3+offset]
+tab_draft= tab_objs[4+offset]
+tab_ing  = tab_objs[5+offset]
+
+def _to_hits(items):
+    return [(sp["best_idx"], sp["meta"], sp["best_chunk"]) for sp in items]
+
+# ---------------- Results with pagination (10 per page) ----------------
+with tab_res:
+    if not speeches:
+        st.info("Enter a search to see results.")
+    else:
+        st.subheader("Most Recent" if sort_key == "newest" else "Most Relevant")
+
+        PAGE_SIZE = 10
+        total = len(speeches)
+        total_pages = max(1, math.ceil(total / PAGE_SIZE))
+        page = max(1, min(st.session_state.page, total_pages))
+
+        start = (page - 1) * PAGE_SIZE
+        end = min(start + PAGE_SIZE, total)
+        page_items = speeches[start:end]
+
+        # Render page items
+        for sp in page_items:
+            m = sp["meta"]; ch = sp["best_chunk"]
+            date_s = str(m.get('date'))
+            title = m.get('title')
+            link = m.get('link')
+            if layout_mode == "Compact cards":
+                st.markdown(f'<div class="card"><h4>{date_s} — <a href="{link}">{title}</a></h4>', unsafe_allow_html=True)
+                sys = "You are an IMF speech analyst. Produce a concise snippet and 3–5 bullets grounded only in the excerpt."
+                usr = f"Excerpt:\n{ch}\n\nReturn a 1–2 sentence snippet, then 3–5 bullets of key points."
+                key = f"res::{date_s}::{title}::{model_preferred}"
+                (md, used_model) = llm_cached(key, sys, usr, model=model_preferred,
+                                              max_tokens=PER_ITEM_TOKENS, temperature=0.2,
+                                              stream=True)
+                st.caption(f"Model: {used_model}")
+                st.markdown("</div>", unsafe_allow_html=True)
+            else:
+                st.markdown(f"**{date_s} — [{title}]({link})**")
+                sys = "You are an IMF speech analyst. Produce a concise snippet and 3–5 bullets grounded only in the excerpt."
+                usr = f"Excerpt:\n{ch}\n\nReturn a 1–2 sentence snippet, then 3–5 bullets of key points."
+                key = f"res::{date_s}::{title}::{model_preferred}"
+                (md, used_model) = llm_cached(key, sys, usr, model=model_preferred,
+                                              max_tokens=PER_ITEM_TOKENS, temperature=0.2,
+                                              stream=True)
+                st.caption(f"Model: {used_model}")
+
+        # Pagination controls
+        col_a, col_b, col_c = st.columns([1, 2, 1])
+        with col_a:
+            if st.button("◀︎ Prev", disabled=(page <= 1)):
+                st.session_state.page = max(1, page - 1)
+                st.experimental_rerun()
+        with col_b:
+            st.markdown(f"<div style='text-align:center'>Page {page} of {total_pages} • Showing {start+1}–{end} of {total}</div>", unsafe_allow_html=True)
+        with col_c:
+            if st.button("Next ▶︎", disabled=(page >= total_pages)):
+                st.session_state.page = min(total_pages, page + 1)
+                st.experimental_rerun()
+
+        with st.expander("Sources used on this page"):
+            page_sources = list(sources_from_speeches(page_items))
+            if not page_sources:
+                st.info("No sources to show.")
+            else:
+                for (d, t, l) in page_sources:
+                    st.markdown(f"- {d} — [{t}]({l})")
+                lines = [f"{d} — {t} — {l}" for (d,t,l) in page_sources]
+                all_sources_text = "\n".join(lines)
+                st.markdown("**Copy all sources:**")
+                st.text_area("All sources (copy)", all_sources_text, height=120, label_visibility="collapsed")
+                st.download_button("Download sources (.txt)", all_sources_text.encode("utf-8"),
+                                   file_name="sources.txt", mime="text/plain")
+
+# ---------------- Thematic Evolution (year-by-year talking points + narrative) ----------------
+with tab_comp:
+    if not speeches:
+        st.info("Enter a search to analyze thematic evolution.")
+    else:
+        st.subheader("Thematic Evolution (LLM) — Year-by-Year Talking Points")
+        st.caption(f"Analyzing: **{filters['date_from'].isoformat()} → {filters['date_to'].isoformat()}**")
+
+        def _within(meta, start_date, end_date):
+            import datetime as dt
+            try:
+                d = dt.date.fromisoformat(str(meta.get("date")))
+                return start_date <= d <= end_date
+            except Exception:
+                return False
+
+        # Use ALL matched speeches in the chosen date range (not just current page)
+        range_items = [sp for sp in speeches if _within(sp["meta"], filters['date_from'], filters['date_to'])]
+
+        if not range_items:
+            st.warning("No matching content in this date range. Try broadening the range.")
+        else:
+            # Group by year, preserving newest-first within each year
+            def _year_of(meta):
+                try:
+                    return int(str(meta.get("date"))[:4])
+                except Exception:
+                    return None
+
+            by_year = {}
+            for sp in range_items:
+                y = _year_of(sp["meta"])
+                if not y:
+                    continue
+                by_year.setdefault(y, []).append(sp)
+
+            # Sort years ascending and items within each year by date desc
+            years_asc = sorted(by_year.keys())
+            for y in years_asc:
+                by_year[y] = sorted(by_year[y], key=lambda sp: _parse_date(sp["meta"].get("date")), reverse=True)
+
+            # Build per-year context with a reasonable cap per year
+            per_year_limit = 8 if len(years_asc) <= 2 else max(4, 14 // max(1, len(years_asc)))
+            year_sections = []
+            for y in years_asc:
+                hits = _to_hits(by_year[y][:per_year_limit])
+                ctx = format_hits_for_context(hits, limit=per_year_limit, char_limit=1100)
+                if ctx.strip():
+                    year_sections.append(f"=== Year {y} ===\n{ctx}")
+            full_ctx = "\n\n".join(year_sections) if year_sections else "(no matching context)"
+
+            # 1) Year-by-year talking points
+            sys_focus = (
+                "You are a senior IMF communications strategist. Using ONLY the provided context grouped by year, "
+                "produce clear, issue-focused talking points for each year. Do not invent facts. "
+                "When useful, cite with (Month YYYY — Title) derived from the headers in the context."
+            )
+            usr_focus = f"""Topic: {query}
+
+Date range: {filters['date_from'].isoformat()} → {filters['date_to'].isoformat()}
+
+Context grouped by year (each item starts with [YYYY-MM-DD — Title](link)):
+{full_ctx}
+
+Task:
+- For each year present in the context, output a heading "### Year YYYY"
+- Under each year, list 4–7 concise bullets of the **key talking points** that year, grounded strictly in the context.
+- Bullets should be crisp, policy-relevant, and non-overlapping.
+- If appropriate, include short cite tags like (Mar 2024 — Global Economy) using the header info.
+Return clean Markdown only.
+"""
             st.markdown("### Year-by-Year Talking Points")
-            st.code("Not found in corpus.")
+            (focus_md, used_model1) = llm_cached(
+                f"peryear_tps::{query}::{filters['date_from']}::{filters['date_to']}::{DEFAULT_MODEL}",
+                sys_focus, usr_focus, model=DEFAULT_MODEL, max_tokens=PER_ITEM_TOKENS+150,
+                temperature=0.2, stream=True)
+            st.caption(f"Model: {used_model1}")
+
+            # 2) Messaging evolution narrative for the whole interval
+            sys_evol = (
+                "Analyze how messaging evolved across the entire date range. Use ONLY the same context. "
+                "Be concrete about shifts in emphasis, new themes that emerged, and any themes that receded. "
+                "Cite with (Month YYYY — Title) where helpful. Avoid speculation."
+            )
+            usr_evol = f"""Topic: {query}
+Range: {filters['date_from'].isoformat()} → {filters['date_to'].isoformat()}
+
+Same context as above:
+{full_ctx}
+
+Task:
+- Write a concise narrative (6–10 sentences) explaining how the **talking points shifted or held steady** over time.
+- Be specific about what rose/fell in prominence and when.
+Return a compact paragraph in Markdown.
+"""
             st.markdown("### Messaging Evolution (Narrative)")
-            st.code("Not found in corpus.")
+            (evol_md, used_model2) = llm_cached(
+                f"evolution_narr::{query}::{filters['date_from']}::{filters['date_to']}::{DEFAULT_MODEL}",
+                sys_evol, usr_evol, model=DEFAULT_MODEL, max_tokens=PER_ITEM_TOKENS,
+                temperature=0.2, stream=True)
+            st.caption(f"Model: {used_model2}")
+
+            with st.expander("Show sources (Thematic Evolution)"):
+                for (d, t, l) in sources_from_speeches(range_items):
+                    st.markdown(f"- {d} — [{t}]({l})")
+
+# ---------------- Optional Trajectory tab ----------------
+if _HAS_P3:
+    with tab_traj:
+        if not speeches:
+            st.info("Enter a search above to view trajectory analysis.")
         else:
-            # 1) Year-by-Year talking points
-            if strict_mode:
-                sys_focus = (
-                    "You are a senior IMF communications strategist. "
-                    "Using ONLY the provided context grouped by date headers, produce talking points. "
-                    "If the context is insufficient for any period, reply exactly: Not found in corpus."
-                )
+            st.subheader("Messaging Trajectory")
+            ctx = format_hits_for_context(_to_hits(speeches[:30]), limit=18)
+            series = build_issue_trajectory(query, ctx, DEFAULT_MODEL)  # DataFrame: year, issue, share
+            if not series.empty:
+                fig = px.area(series, x="year", y="share", color="issue", groupnorm="fraction")
+                st.plotly_chart(fig, use_container_width=True)
+                forecast = forecast_issue_trends(series)
+                if not forecast.empty:
+                    st.markdown("**Next-year trend (simple forecast)**")
+                    fig2 = px.bar(forecast, x="issue", y="forecast_share")
+                    st.plotly_chart(fig2, use_container_width=True)
+                nar = trajectory_narrative(query, ctx, DEFAULT_MODEL)
+                st.markdown(nar)
             else:
-                sys_focus = (
-                    "You are a senior IMF communications strategist. Using ONLY the provided context, "
-                    "produce clear, issue-focused talking points by date. Cite with (YYYY-MM-DD — Title)."
-                )
-            usr_focus = f"Context grouped by date and title:\n\n{full_ctx}\n\n---\n\nTask: Produce concise talking points grouped by date."
+                st.info("No trajectory could be derived from current context.")
 
-            # 2) Narrative of messaging evolution
-            if strict_mode:
-                sys_evol = (
-                    "Analyze how messaging evolved using ONLY the provided context. "
-                    "If the context is insufficient, reply exactly: Not found in corpus."
-                )
-            else:
-                sys_evol = (
-                    "Analyze how messaging evolved across the entire date range using ONLY the provided context. "
-                    "Be concrete about shifts in emphasis; cite with (YYYY-MM-DD — Title) where helpful."
-                )
-            usr_evol = f"Context:\n\n{full_ctx}\n\n---\n\nTask: Write a concise evolution narrative."
-
-            if not OPENAI_OK or not os.environ.get("OPENAI_API_KEY"):
-                st.error("OpenAI client unavailable or OPENAI_API_KEY not set.")
-            else:
-                client = OpenAI()
-                with st.spinner("Generating year-by-year talking points..."):
-                    resp1 = client.chat.completions.create(
-                        model=CHAT_MODEL,
-                        messages=[{"role": "system", "content": sys_focus},
-                                  {"role": "user", "content": usr_focus}],
-                        temperature=0.0 if strict_mode else 0.2,
-                    )
-                    out1 = (resp1.choices[0].message.content or "").strip()
-
-                with st.spinner("Generating evolution narrative..."):
-                    resp2 = client.chat.completions.create(
-                        model=CHAT_MODEL,
-                        messages=[{"role": "system", "content": sys_evol},
-                                  {"role": "user", "content": usr_evol}],
-                        temperature=0.0 if strict_mode else 0.2,
-                    )
-                    out2 = (resp2.choices[0].message.content or "").strip()
-
-                st.markdown("### Year-by-Year Talking Points")
-                if strict_mode and out1.lower() == "not found in corpus.":
-                    st.code("Not found in corpus.")
-                else:
-                    st.write(out1)
-
-                st.markdown("### Messaging Evolution (Narrative)")
-                if strict_mode and out2.lower() == "not found in corpus.":
-                    st.code("Not found in corpus.")
-                else:
-                    st.write(out2)
-
-# ===== Rapid Response Tab =====
+# ---------------- Rapid Response tab ----------------
 with tab_rr:
-    st.subheader("📰 Rapid Response (Media Q&A)")
-    rr_q = st.text_area("Paste a media inquiry or topic prompt:", height=120, key="q_rr")
-    run_rr = st.button("Draft response", key="run_rr")
-    if run_rr and rr_q.strip():
-        with st.spinner("Retrieving supporting excerpts..."):
-            rr_hits = retrieve(query=rr_q, k=max(12, top_k), score_threshold=score_threshold,
-                               start_date=start, end_date=end)
-        ctx_rr = _format_context_blocks(rr_hits)
+    st.subheader("Rapid Response")
+    inquiry = st.text_area("Media inquiry from journalist", "")
+    if st.button("Generate response") and inquiry.strip():
+        try:
+            rr_speeches, _ = retrieve_speeches(
+                query=inquiry,
+                index=index, metas=metas, chunks=chunks,
+                filters=filters,
+                sort="relevance",
+                precision=high_precision,
+                strictness=strictness,
+                exact_phrase=True,
+                exclude_terms=[],
+                core_topic_only=core_topic_only,
+                use_llm_rerank=True,
+                model=DEFAULT_MODEL
+            )
+        except Exception as e:
+            st.error(f"Search failed: {e}")
+            rr_speeches = []
 
-        if strict_mode and not _has_context(ctx_rr):
-            st.code("Not found in corpus.")
+        rr_hits = _to_hits(rr_speeches[:30])
+        ctx_rr = format_hits_for_context(rr_hits, limit=18)
+        if ctx_rr.strip():
+            sys = (
+                "You are Kristalina Georgieva's communications aide. "
+                "Using only the provided excerpts from her speeches, answer the media inquiry "
+                "with 3–5 concise bullet points followed by a short narrative paragraph."
+            )
+            usr = f"""Inquiry: {inquiry}
+
+Context:
+{ctx_rr}
+
+Tasks:
+- Provide 3–5 bullet points addressing the inquiry.
+- Then write a short narrative paragraph synthesizing the answer."""
+            key = f"rr::{hashlib.sha256((inquiry+ctx_rr).encode()).hexdigest()}::{DEFAULT_MODEL}"
+            (rr_md, used_model) = llm_cached(key, sys, usr, model=DEFAULT_MODEL,
+                                             max_tokens=500, temperature=0.2, stream=True)
+            st.caption(f"Model: {used_model}")
+            with st.expander("Show sources (Rapid Response)"):
+                for (d,t,l) in sources_from_speeches(rr_speeches):
+                    st.markdown(f"- {d} — [{t}]({l})")
         else:
-            if strict_mode:
-                sys = (
-                    "You are Kristalina Georgieva's communications aide. "
-                    "Using ONLY the provided excerpts from her speeches, answer the inquiry. "
-                    "If the excerpts are insufficient, reply exactly: Not found in corpus."
-                )
-            else:
-                sys = (
-                    "You are Kristalina Georgieva's communications aide. "
-                    "Using the provided excerpts from her speeches, produce 3–5 bullet points "
-                    "followed by a short narrative paragraph suitable for media."
-                )
-            usr = f"Excerpts:\n\n{ctx_rr}\n\n---\n\nInquiry:\n{rr_q}"
+            st.warning("No relevant context found to answer the inquiry.")
+    else:
+        st.info("Paste the inquiry and click Generate response.")
 
-            if not OPENAI_OK or not os.environ.get("OPENAI_API_KEY"):
-                st.error("OpenAI client unavailable or OPENAI_API_KEY not set.")
-            else:
-                client = OpenAI()
-                resp = client.chat.completions.create(
-                    model=CHAT_MODEL,
-                    messages=[{"role": "system", "content": sys},
-                              {"role": "user", "content": usr}],
-                    temperature=0.0 if strict_mode else 0.2,
-                )
-                out = (resp.choices[0].message.content or "").strip()
-                if strict_mode and out.lower() == "not found in corpus.":
-                    st.code("Not found in corpus.")
-                else:
-                    st.write(out)
-
-# ===== Draft Assist Tab =====
+# ---------------- Draft Assist tab ----------------
 with tab_draft:
-    st.subheader("📝 Draft Assist (Outline)")
-    draft_q = st.text_input("Topic or angle for a short outline (speaker's voice)", key="q_draft")
-    run_d = st.button("Generate outline", key="run_draft")
-    if run_d and draft_q.strip():
-        with st.spinner("Retrieving style & substance context..."):
-            draft_hits = retrieve(query=draft_q, k=max(16, top_k), score_threshold=score_threshold,
-                                  start_date=start, end_date=end)
-        ctx = _format_context_blocks(draft_hits)
+    st.subheader("First Draft Speech Assist")
+    big_ideas = st.text_input("Big ideas/themes (comma-separated)", "")
+    r1c1, r1c2 = st.columns(2)
+    audience = r1c1.text_input("Audience", "")
+    venue = r1c2.text_input("Venue", "")
+    r2c1, r2c2 = st.columns(2)
+    tone = r2c1.text_input("Tone", "")
+    style = r2c2.text_input("Style", "")
 
-        if strict_mode and not _has_context(ctx):
-            st.code("Not found in corpus.")
-        else:
-            if strict_mode:
-                sys = (
-                    "You are drafting a first-pass speech outline in the speaker's established style, "
-                    "using ONLY the provided context. If the context is insufficient, reply exactly: Not found in corpus."
-                )
-            else:
-                sys = (
-                    "You are drafting a first-pass speech outline in the speaker's established style, "
-                    "grounded ONLY in the provided context. Keep it concise and structured."
-                )
-            usr = f"Context:\n\n{ctx}\n\n---\n\nTask: Draft a concise outline for: {draft_q}"
+    if st.button("Draft outline") and big_ideas.strip():
+        try:
+            draft_speeches, _ = retrieve_speeches(
+                query=big_ideas,
+                index=index, metas=metas, chunks=chunks,
+                filters=filters,
+                sort=sort_key,
+                precision=high_precision,
+                strictness=strictness,
+                exact_phrase=False,
+                exclude_terms=[],
+                core_topic_only=core_topic_only,
+                use_llm_rerank=True,
+                model=DEFAULT_MODEL,
+            )
+        except Exception as e:
+            st.error(f"Search failed: {e}")
+            draft_speeches = []
 
-            if not OPENAI_OK or not os.environ.get("OPENAI_API_KEY"):
-                st.error("OpenAI client unavailable or OPENAI_API_KEY not set.")
+        draft_hits = _to_hits(draft_speeches[:30])
+        ctx = format_hits_for_context(draft_hits, limit=18)
+
+        params = []
+        if audience.strip(): params.append(f"Audience: {audience}")
+        if venue.strip(): params.append(f"Venue: {venue}")
+        if tone.strip(): params.append(f"Tone: {tone}")
+        if style.strip(): params.append(f"Style: {style}")
+        params.append(f"Big ideas: {big_ideas}")
+        param_block = "\n".join(params)
+
+        sys = "You are drafting a first-pass speech outline in the speaker's established style, grounded ONLY in provided context."
+        usr = f"""Context (date-ordered excerpts):
+{ctx}
+
+{param_block}
+
+Tasks:
+- Title and 1–2 sentence setup
+- Outline with sections and 2–3 bullets each (grounded in context)
+- 8–10 pull quotes with (Month YYYY — Title)
+- Closing paragraph
+Return clean Markdown."""
+        key = f"draft::{big_ideas}::{audience}::{venue}::{tone}::{style}"
+        (md, used_model) = llm_cached(key, sys, usr, model=DEFAULT_MODEL,
+                                      max_tokens=1200, temperature=0.3, stream=True)
+        st.caption(f"Model: {used_model}")
+        st.download_button("Download draft (Markdown)", md.encode("utf-8"), file_name="speech_draft.md", mime="text/markdown")
+    else:
+        st.info("Provide big ideas and optional parameters, then click Draft outline.")
+
+# ---------------- Ingest & Sync tab ----------------
+with tab_ing:
+    st.subheader("Ingest & Sync")
+    st.markdown(
+        "<div class='small'>Upload new sources (PDF, DOCX, TXT/MD, HTML, audio/video) or paste a YouTube/Vimeo URL. "
+        "All originals go to <code>./corpus/raw/</code>, normalized text to <code>./corpus/processed/</code>, "
+        "and metadata JSON to <code>./corpus/meta/</code>. After ingest you can rebuild the index. "
+        "If this folder is a Git repo with a remote, I’ll try to commit & push.</div>", unsafe_allow_html=True
+    )
+
+    # Corpus directories
+    RAW_DIR = Path("corpus/raw")
+    PROC_DIR = Path("corpus/processed")
+    META_DIR = Path("corpus/meta")
+    for p in [RAW_DIR, PROC_DIR, META_DIR]:
+        p.mkdir(parents=True, exist_ok=True)
+
+    up_files = st.file_uploader("Upload files", type=[
+        "pdf","docx","txt","md","html","htm",
+        "mp3","wav","m4a","mp4","mov","avi","mkv"
+    ], accept_multiple_files=True)
+    url_generic = st.text_input("Optional: Generic source URL (web page, etc.)", placeholder="https://…")
+    title_hint = st.text_input("Optional: Title override (if empty, filename or URL is used)")
+
+    st.markdown("#### Fetch from YouTube/Vimeo")
+    cookie_upload = st.file_uploader("YouTube cookies.txt (optional, for age/region/consent-gated videos)", type=["txt"], accept_multiple_files=False, key="yt_cookies")
+    proxy_url = st.text_input("Proxy (optional)", placeholder="http://user:pass@host:port or http://host:port")
+    video_url = st.text_input("Video URL", placeholder="https://www.youtube.com/watch?v=… or https://vimeo.com/…")
+    spk_box = st.expander("Speaker filtering (optional)")
+    with spk_box:
+        st.caption("If the video has multiple speakers, you can filter to **only Kristalina** using diarization + voice matching.")
+        enable_spk_filter = st.toggle("Filter to a specific speaker (Kristalina)", value=False)
+        ref_voice = st.file_uploader("Upload a short reference audio of Kristalina (5–20s WAV/MP3 recommended)", type=["wav","mp3","m4a"])
+        st.caption("Requires: pyannote.audio + a Hugging Face token in `HUGGINGFACE_TOKEN`, and speechbrain + torch.")
+
+    colf1, colf2 = st.columns([1,2])
+    with colf1:
+        fetch_btn = st.button("Fetch & Transcribe")
+    with colf2:
+        st.caption("Uses yt-dlp to download best audio and Whisper to transcribe (needs `yt-dlp`, `ffmpeg`, and an API key or local Whisper).")
+
+    added = []
+    errors = []
+
+    if st.button("Ingest uploaded sources"):
+        # Handle file uploads
+        if up_files:
+            for uf in up_files:
+                try:
+                    slug = _safe_slug(uf.name)
+                    raw_path = RAW_DIR / slug
+                    raw_path.write_bytes(uf.getbuffer())
+
+                    meta = {
+                        "title": title_hint or uf.name,
+                        "source": "upload",
+                        "filename": uf.name,
+                        "stored_at": str(raw_path),
+                        "ingested_at": _now_iso(),
+                        "type": Path(uf.name).suffix.lower().lstrip("."),
+                    }
+                    # Normalize to text
+                    if raw_path.suffix.lower() in [".mp3",".wav",".m4a",".mp4",".mov",".avi",".mkv"]:
+                        tr = transcribe_bytes(uf.getbuffer(), uf.name)
+                        text_out = tr["text"]
+                    else:
+                        text_out = doc_to_text(raw_path)
+
+                    proc_name = f"{slug}.txt"
+                    proc_path = PROC_DIR / proc_name
+                    proc_path.write_text(text_out, encoding="utf-8")
+
+                    meta["normalized_text"] = str(proc_path)
+                    (META_DIR / f"{slug}.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+                    added.append(slug)
+                except Exception as e:
+                    errors.append(f"{uf.name}: {e}")
+
+        # Handle simple URL capture (store URL meta; fetching left to pipeline)
+        if url_generic.strip():
+            try:
+                slug = _safe_slug(url_generic)
+                meta = {
+                    "title": title_hint or url_generic,
+                    "source": "url",
+                    "url": url_generic,
+                    "ingested_at": _now_iso(),
+                    "note": "Stored URL reference; fetch/transcribe externally or paste content as .txt for now."
+                }
+                (META_DIR / f"{slug}.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+                added.append(slug)
+            except Exception as e:
+                errors.append(f"URL save failed: {e}")
+
+        # Feedback
+        if added:
+            st.success(f"Ingested: {', '.join(added)}")
+        if errors:
+            st.error("Some items failed:\n" + "\n".join(errors))
+
+        # Rebuild index if anything added
+        if added:
+            if build_index_main:
+                with st.spinner("Rebuilding index…"):
+                    try:
+                        build_index_main()
+                        st.success("Index rebuilt.")
+                    except Exception as e:
+                        st.error(f"Index rebuild failed: {e}")
             else:
-                client = OpenAI()
-                resp = client.chat.completions.create(
-                    model=CHAT_MODEL,
-                    messages=[{"role": "system", "content": sys},
-                              {"role": "user", "content": usr}],
-                    temperature=0.0 if strict_mode else 0.2,
-                )
-                out = (resp.choices[0].message.content or "").strip()
-                if strict_mode and out.lower() == "not found in corpus.":
-                    st.code("Not found in corpus.")
+                st.info("Index builder not found. Ensure build_index.py is available with `main()` entrypoint.")
+
+            # Try git add/commit/push
+            try:
+                repo = git.Repo(".", search_parent_directories=True) if git else None
+                if repo:
+                    repo.index.add([str(RAW_DIR), str(PROC_DIR), str(META_DIR), "index.faiss", "meta.json", "chunks.json"])
+                    repo.index.commit(f"Ingest via app: {len(added)} new source(s)")
+                    if repo.remotes:
+                        origin = repo.remotes.origin
+                        origin.push()
+                        st.success("Changes pushed to remote.")
+                    else:
+                        st.info("No git remote configured. Commit saved locally.")
                 else:
-                    st.write(out)
+                    st.info("GitPython not installed or not a git repo. Skipped commit/push.")
+            except Exception as e:
+                st.warning(f"Git sync skipped/failed: {e}")
 
-# ===== Corpus Tab =====
-with tab_corpus:
-    st.subheader("📚 Corpus Browser & Maintenance")
+        # Reload index in-session
+        if added:
+            try:
+                index, metas, chunks = load_index()
+                df = load_df()
+                st.toast("Index reloaded.", icon="✅")
+            except Exception as e:
+                st.warning(f"Reload failed (you may need to rerun): {e}")
 
-    vecs, meta = load_index()
-    # Aggregate by source_id
-    by_source: Dict[str, Dict[str, Any]] = {}
-    for m in meta:
-        sid = m.get("source_id", "unknown")
-        item = by_source.setdefault(sid, {"source_id": sid, "source_name": m.get("source_name", "?"),
-                                          "title": m.get("title"), "date_iso": m.get("date_iso"),
-                                          "num_chunks": 0})
-        item["num_chunks"] += 1
-
-    if by_source:
-        # Display as simple table
-        rows = sorted(by_source.values(), key=lambda x: (x.get("date_iso") or "", x.get("source_name") or ""))
-        st.write(f"**Documents in corpus:** {len(rows)}")
-        # Table-ish markdown
-        st.markdown("| Source Name | Date | Title | Chunks | Source ID |")
-        st.markdown("|---|---|---|---:|---|")
-        for r in rows:
-            st.markdown(f"| {r.get('source_name','?')} | {r.get('date_iso','')} | {r.get('title','')} | {r['num_chunks']} | `{r['source_id']}` |")
-
-        # Delete flow
-        st.markdown("---")
-        st.markdown("### Delete from corpus")
-        del_ids = st.text_input("Enter one or more `source_id` values to delete (comma-separated).")
-        if st.button("Delete selected"):
-            ids = [s.strip() for s in del_ids.split(",") if s.strip()]
-            if not ids:
-                st.warning("No source_id provided.")
-            else:
-                # Build mask of rows to keep
-                keep_mask = [m.get("source_id") not in ids for m in meta]
-                new_meta = [m for m, keep in zip(meta, keep_mask) if keep]
-                new_vecs = vecs[keep_mask] if vecs.size and len(keep_mask) == vecs.shape[0] else np.zeros((0, EMBED_DIM), dtype=np.float32)
-                save_index(new_vecs, new_meta)
-                st.success(f"Deleted items with source_id in: {ids}. Re-run queries to use updated corpus.")
-    else:
-        st.info("Corpus is empty. Upload content or ingest from PKL.")
-
-    st.markdown("---")
-    st.markdown(f"### Re-import from `{PKL_PATH}`")
-    if st.button("Import now"):
+    # Fetch & transcribe flow
+    if fetch_btn and video_url.strip():
         try:
-            stats = ingest_pkl(PKL_PATH)
-            if stats.get("loaded"):
-                st.success(f"Imported: {stats['new_docs']} new doc(s), {stats['new_chunks']} new chunk(s).")
+            cookies_bytes = cookie_upload.read() if cookie_upload is not None else None
+            info = ytdlp_fetch_audio(video_url, RAW_DIR, cookies_bytes=cookies_bytes, proxy=(proxy_url or None))
+            raw_audio_path = info["path"]
+            title = info["title"]
+            # Transcribe with timestamps
+            tr = transcribe_bytes(raw_audio_path.read_bytes(), raw_audio_path.name)
+            text_out = tr["text"]
+
+            # Optional: speaker filtering to Kristalina
+            filtered_used = False
+            if enable_spk_filter:
+                if not ref_voice:
+                    st.warning("Upload a reference audio to enable speaker filtering.")
+                else:
+                    try:
+                        filtered = diarize_and_filter_audio(raw_audio_path, tr, ref_voice)
+                        if filtered.get("text"):
+                            text_out = filtered["text"]
+                            filtered_used = True
+                            st.success("Applied speaker filtering: kept segments matching the reference voice.")
+                        else:
+                            st.info("Speaker filtering produced no segments; using full transcript.")
+                    except Exception as e:
+                        st.warning(f"Speaker filtering skipped: {e}")
+
+            proc_name = f"{_safe_slug(title)}.txt"
+            proc_path = PROC_DIR / proc_name
+            proc_path.write_text(text_out, encoding="utf-8")
+
+            meta = {
+                "title": title_hint or title,
+                "source": "youtube_vimeo",
+                "url": video_url,
+                "stored_at": str(raw_audio_path),
+                "normalized_text": str(proc_path),
+                "uploader": info.get("uploader"),
+                "upload_date": info.get("upload_date"),
+                "ingested_at": _now_iso(),
+                "type": "audio",
+                "speaker_filtered": bool(filtered_used),
+            }
+            (META_DIR / f"{_safe_slug(title)}.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            st.success(f"Fetched & transcribed: {title}")
+
+            # Rebuild index
+            if build_index_main:
+                with st.spinner("Rebuilding index…"):
+                    try:
+                        build_index_main()
+                        st.success("Index rebuilt.")
+                    except Exception as e:
+                        st.error(f"Index rebuild failed: {e}")
             else:
-                st.info("No records imported.")
+                st.info("Index builder not found. Ensure build_index.py exposes `main()`.")
+
+            # Git sync
+            try:
+                repo = git.Repo(".", search_parent_directories=True) if git else None
+                if repo:
+                    repo.index.add([str(RAW_DIR), str(PROC_DIR), str(META_DIR), "index.faiss", "meta.json", "chunks.json"])
+                    repo.index.commit(f"Ingest via app: fetched {title}")
+                    if repo.remotes:
+                        origin = repo.remotes.origin
+                        origin.push()
+                        st.success("Changes pushed to remote.")
+                    else:
+                        st.info("No git remote configured. Commit saved locally.")
+                else:
+                    st.info("GitPython not installed or not a git repo. Skipped commit/push.")
+            except Exception as e:
+                st.warning(f"Git sync skipped/failed: {e}")
+
+            # Reload index
+            try:
+                index, metas, chunks = load_index()
+                df = load_df()
+                st.toast("Index reloaded.", icon="✅")
+            except Exception as e:
+                st.warning(f"Reload failed (you may need to rerun): {e}")
+
         except Exception as e:
-            st.error(f"Import failed: {e}")
-
-# ---- Manual Upload / Ingest ----
-st.divider()
-st.subheader("📥 Upload / Ingest Speeches (Manual)")
-st.write("Upload TXT, MD, PDF, or DOCX files. The app will chunk and index them locally (no web calls).")
-
-uploads = st.file_uploader("Add speeches to corpus", type=["txt", "md", "pdf", "docx"], accept_multiple_files=True)
-
-if uploads:
-    ensure_store()
-    texts: List[str] = []
-    metas: List[Dict[str, Any]] = []
-    for f in uploads:
-        raw = f.read()
-        content = read_file_to_text(f.name, raw)
-        if not content.strip():
-            st.warning(f"Skipped (empty/unreadable): {f.name}")
-            continue
-        chunks = chunk_text(content)
-        if not chunks:
-            st.warning(f"No text chunks found: {f.name}")
-            continue
-
-        # In manual uploads, synthesize a stable source_id based on name+content digest
-        relname = f"manual/{f.name}"
-        digest = file_digest(relname, raw)
-        title_guess = os.path.splitext(os.path.basename(f.name))[0].replace("_", " ").replace("-", " ").strip()
-        date_guess = try_parse_date_from_text(content) or try_parse_date_from_text(title_guess)
-
-        for i, ch in enumerate(chunks):
-            metas.append({
-                "id": f"{digest}:{i}",
-                "chunk_id": i,
-                "source_id": digest,
-                "source_name": relname,
-                "title": title_guess,
-                "date_iso": date_guess,  # may be None
-                "text": ch,
-            })
-            texts.append(ch)
-
-    if texts:
-        try:
-            client = OpenAI()
-            new_vecs = embed_texts(client, texts)
-        except Exception as e:
-            st.error(f"Embedding failed: {e}")
-            st.stop()
-
-        vecs, meta = load_index()
-        merged_vecs = new_vecs if vecs.size == 0 else np.vstack([vecs, new_vecs])
-        merged_meta = metas if not meta else meta + metas
-        save_index(merged_vecs, merged_meta)
-        st.success(f"Ingested {len(texts)} chunks from {len(uploads)} file(s).")
-    else:
-        st.info("No new chunks ingested.")
-
-st.divider()
-st.caption("Strict mode = 100% contained: no web calls, no general model knowledge beyond retrieved chunks.")
+            st.error(f"Fetch/transcribe failed: {e}")
+            st.info("If this is a YouTube 403/age/region error, try adding a cookies.txt from your browser and/or specifying a proxy above, then retry.")
